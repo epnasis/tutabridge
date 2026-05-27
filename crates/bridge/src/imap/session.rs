@@ -220,7 +220,8 @@ impl ImapSession {
             let flags = folder.special_use.as_deref().unwrap_or("");
             responses.push(format!(
                 "* LIST ({}) \"/\" \"{}\"\r\n",
-                flags, folder.imap_path
+                flags,
+                super::utf7::encode(&folder.imap_path)
             ));
         }
         responses.push(format!("{} OK LIST completed\r\n", tag));
@@ -233,8 +234,9 @@ impl ImapSession {
             return vec![format!("{} NO Not authenticated\r\n", tag)];
         }
 
-        let folder_name = args.trim().trim_matches('"');
-        let folder = match self.store.folder_by_imap_path(folder_name).await {
+        let raw_name = args.trim().trim_matches('"');
+        let folder_name = super::utf7::decode(raw_name).unwrap_or_else(|| raw_name.to_string());
+        let folder = match self.store.folder_by_imap_path(&folder_name).await {
             Some(f) => f,
             None => {
                 return vec![format!("{} NO [NONEXISTENT] Mailbox does not exist\r\n", tag)];
@@ -283,8 +285,9 @@ impl ImapSession {
         if self.state == State::NotAuthenticated {
             return vec![format!("{} NO Not authenticated\r\n", tag)];
         }
-        let folder_name = args.split_whitespace().next().unwrap_or("").trim_matches('"');
-        let stored = match self.store.folder_by_imap_path(folder_name).await {
+        let (raw_name, _) = parse_imap_token(args.trim());
+        let folder_name = super::utf7::decode(&raw_name).unwrap_or_else(|| raw_name.clone());
+        let stored = match self.store.folder_by_imap_path(&folder_name).await {
             Some(folder) => self.store.get_folder(&folder.id).await,
             None => Vec::new(),
         };
@@ -293,7 +296,7 @@ impl ImapSession {
         vec![
             format!(
                 "* STATUS \"{}\" (MESSAGES {} UNSEEN {} RECENT 0 UIDNEXT {} UIDVALIDITY 1)\r\n",
-                folder_name, count, unseen, self.uid_next
+                raw_name, count, unseen, self.uid_next
             ),
             format!("{} OK STATUS completed\r\n", tag),
         ]
