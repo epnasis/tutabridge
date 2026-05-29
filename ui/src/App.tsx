@@ -4,10 +4,11 @@ import { Dashboard } from "./components/Dashboard";
 import { ConnectionPanel } from "./components/ConnectionPanel";
 import { ConfigPanel } from "./components/ConfigPanel";
 import { LogsPanel } from "./components/LogsPanel";
+import { BackupPanel } from "./components/BackupPanel";
 import { statusLabel, isError } from "./types";
 import "./App.css";
 
-type Tab = "dashboard" | "connection" | "config" | "logs";
+type Tab = "dashboard" | "connection" | "config" | "backup" | "logs";
 
 function App() {
   const [tab, setTab] = useState<Tab>("dashboard");
@@ -56,6 +57,12 @@ function App() {
             Config
           </button>
           <button
+            className={tab === "backup" ? "active" : ""}
+            onClick={() => setTab("backup")}
+          >
+            Backup
+          </button>
+          <button
             className={tab === "logs" ? "active" : ""}
             onClick={() => setTab("logs")}
           >
@@ -89,6 +96,16 @@ function App() {
             loading={bridge.loading}
             onSave={bridge.saveConfig}
             onRestart={bridge.restartBridge}
+          />
+        )}
+        {tab === "backup" && (
+          <BackupPanel
+            isRunning={isRunning}
+            busy={bridge.backupBusy}
+            progress={bridge.backupProgress}
+            result={bridge.backupResult}
+            error={bridge.backupError}
+            onBackup={bridge.startBackup}
           />
         )}
         {tab === "logs" && (
