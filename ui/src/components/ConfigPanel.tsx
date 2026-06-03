@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
-import type { Config, BridgeStatus } from "../types";
+import { invoke } from "@tauri-apps/api/core";
+import type { Config, BridgeStatus, McpPermission } from "../types";
 
 interface Props {
   config: Config | null;
@@ -16,6 +17,9 @@ export function ConfigPanel({ config, status, loading, onSave, onRestart }: Prop
   const [apiUrl, setApiUrl] = useState("https://app.tuta.com");
   const [syncLimit, setSyncLimit] = useState(500);
   const [fetchAll, setFetchAll] = useState(false);
+  const [mcpPermission, setMcpPermission] = useState<McpPermission>("disabled");
+  const [mcpPort, setMcpPort] = useState(1944);
+  const [mcpCopied, setMcpCopied] = useState(false);
   const [saved, setSaved] = useState(false);
 
   useEffect(() => {
@@ -26,6 +30,8 @@ export function ConfigPanel({ config, status, loading, onSave, onRestart }: Prop
       setApiUrl(config.api_url);
       setFetchAll(config.sync_limit === 0);
       setSyncLimit(config.sync_limit === 0 ? 500 : config.sync_limit);
+      setMcpPermission(config.mcp_permission ?? "disabled");
+      setMcpPort(config.mcp_port ?? 1944);
     }
   }, [config]);
 
@@ -38,9 +44,22 @@ export function ConfigPanel({ config, status, loading, onSave, onRestart }: Prop
       smtp_port: smtpPort,
       api_url: apiUrl,
       sync_limit: fetchAll ? 0 : syncLimit,
+      mcp_permission: mcpPermission,
+      mcp_port: mcpPort,
     });
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
+  };
+
+  const handleCopyMcpConfig = async () => {
+    try {
+      const snippet = await invoke<string>("get_mcp_client_config");
+      await navigator.clipboard.writeText(snippet);
+      setMcpCopied(true);
+      setTimeout(() => setMcpCopied(false), 2000);
+    } catch {
+      /* clipboard denied — ignore */
+    }
   };
 
   return (
@@ -110,6 +129,51 @@ export function ConfigPanel({ config, status, loading, onSave, onRestart }: Prop
           />
         )}
       </div>
+
+      <div className="form-group">
+        <label>AI access (MCP server)</label>
+        <small className="field-hint">
+          Lets an LLM client (Claude Desktop / Code) <strong>read</strong> this
+          mailbox over a local MCP server. Strictly read-only — it can never
+          send, move or delete mail.
+        </small>
+        <select
+          value={mcpPermission}
+          onChange={(e) => setMcpPermission(e.target.value as McpPermission)}
+        >
+          <option value="disabled">Disabled (off)</option>
+          <option value="metadata">
+            Metadata only — folders, search, headers (no body)
+          </option>
+          <option value="full">Full read — also message bodies</option>
+        </select>
+        {mcpPermission === "full" && (
+          <small className="field-hint">
+            ⚠️ The connected LLM can read full message content. Body text is
+            untrusted — a malicious email could try to mislead the model. Only
+            enable with a client you trust.
+          </small>
+        )}
+        {mcpPermission !== "disabled" && (
+          <>
+            <input
+              type="number"
+              value={mcpPort}
+              onChange={(e) => setMcpPort(Number(e.target.value))}
+              placeholder="MCP port (127.0.0.1)"
+            />
+            <button type="button" onClick={handleCopyMcpConfig}>
+              {mcpCopied ? "Copied!" : "Copy client config"}
+            </button>
+            <small className="field-hint">
+              Save first, then paste the copied snippet into your MCP client.
+              The server listens on 127.0.0.1 and requires the bridge password
+              as a bearer token.
+            </small>
+          </>
+        )}
+      </div>
+
       {isRunning && (
         <small className="field-hint">Changes apply after a restart.</small>
       )}
