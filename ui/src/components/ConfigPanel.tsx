@@ -10,7 +10,10 @@ interface Props {
   onRestart: () => Promise<void>;
 }
 
+type Section = "account" | "sync" | "ai";
+
 export function ConfigPanel({ config, status, loading, onSave, onRestart }: Props) {
+  const [section, setSection] = useState<Section>("account");
   const [email, setEmail] = useState("");
   const [imapPort, setImapPort] = useState(1143);
   const [smtpPort, setSmtpPort] = useState(1025);
@@ -58,126 +61,161 @@ export function ConfigPanel({ config, status, loading, onSave, onRestart }: Prop
       setMcpCopied(true);
       setTimeout(() => setMcpCopied(false), 2000);
     } catch {
-      /* clipboard denied — ignore */
+      /* clipboard denied, ignore */
     }
   };
 
   return (
-    <div className="panel">
-      <h2>Configuration</h2>
-      <div className="form-group">
-        <label>Email</label>
-        <input
-          type="email"
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-          placeholder="your@tuta.com"
-        />
-      </div>
-      <div className="form-row">
-        <div className="form-group">
-          <label>IMAP Port</label>
-          <input
-            type="number"
-            value={imapPort}
-            onChange={(e) => setImapPort(Number(e.target.value))}
-          />
-        </div>
-        <div className="form-group">
-          <label>SMTP Port</label>
-          <input
-            type="number"
-            value={smtpPort}
-            onChange={(e) => setSmtpPort(Number(e.target.value))}
-          />
-        </div>
-      </div>
-      <div className="form-group">
-        <label>API URL</label>
-        <input
-          type="url"
-          value={apiUrl}
-          onChange={(e) => setApiUrl(e.target.value)}
-        />
-      </div>
-      <div className="form-group">
-        <label>Offline message bodies</label>
-        <small className="field-hint">
-          Your whole mailbox is always listed and searchable by subject, sender
-          and date. This only sets how many recent message <em>bodies</em> are
-          kept ready offline — older ones load on demand when you open them.
-        </small>
-        <label className="checkbox-field">
-          <input
-            type="checkbox"
-            checked={fetchAll}
-            onChange={(e) => setFetchAll(e.target.checked)}
-          />
-          <span>Keep every message body offline (full local copy)</span>
-        </label>
-        {fetchAll ? (
-          <small className="field-hint">
-            Downloads every body — slow + uses the most disk on large accounts.
-          </small>
-        ) : (
-          <input
-            type="number"
-            min={1}
-            value={syncLimit}
-            onChange={(e) => setSyncLimit(Math.max(1, Number(e.target.value)))}
-            placeholder="Bodies to keep offline (most recent)"
-          />
-        )}
-      </div>
-
-      <div className="form-group">
-        <label>AI access (MCP server)</label>
-        <small className="field-hint">
-          Lets an LLM client (Claude Desktop / Code) <strong>read</strong> this
-          mailbox over a local MCP server. Strictly read-only — it can never
-          send, move or delete mail.
-        </small>
-        <select
-          value={mcpPermission}
-          onChange={(e) => setMcpPermission(e.target.value as McpPermission)}
+    <div className="panel config-panel">
+      <nav className="config-subtabs">
+        <button
+          className={section === "account" ? "active" : ""}
+          onClick={() => setSection("account")}
         >
-          <option value="disabled">Disabled (off)</option>
-          <option value="metadata">
-            Metadata only — folders, search, headers (no body)
-          </option>
-          <option value="full">Full read — also message bodies</option>
-        </select>
-        {mcpPermission === "full" && (
-          <small className="field-hint">
-            ⚠️ The connected LLM can read full message content. Body text is
-            untrusted — a malicious email could try to mislead the model. Only
-            enable with a client you trust.
-          </small>
-        )}
-        {mcpPermission !== "disabled" && (
+          Account
+        </button>
+        <button
+          className={section === "sync" ? "active" : ""}
+          onClick={() => setSection("sync")}
+        >
+          Sync
+        </button>
+        <button
+          className={section === "ai" ? "active" : ""}
+          onClick={() => setSection("ai")}
+        >
+          AI access
+        </button>
+      </nav>
+
+      <div className="config-body">
+        {section === "account" && (
           <>
-            <input
-              type="number"
-              value={mcpPort}
-              onChange={(e) => setMcpPort(Number(e.target.value))}
-              placeholder="MCP port (127.0.0.1)"
-            />
-            <button type="button" onClick={handleCopyMcpConfig}>
-              {mcpCopied ? "Copied!" : "Copy client config"}
-            </button>
-            <small className="field-hint">
-              Save first, then paste the copied snippet into your MCP client.
-              The server listens on 127.0.0.1 and requires the bridge password
-              as a bearer token.
-            </small>
+            <div className="form-group">
+              <label>Email</label>
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="your@tuta.com"
+              />
+            </div>
+            <div className="form-row">
+              <div className="form-group">
+                <label>IMAP Port</label>
+                <input
+                  type="number"
+                  value={imapPort}
+                  onChange={(e) => setImapPort(Number(e.target.value))}
+                />
+              </div>
+              <div className="form-group">
+                <label>SMTP Port</label>
+                <input
+                  type="number"
+                  value={smtpPort}
+                  onChange={(e) => setSmtpPort(Number(e.target.value))}
+                />
+              </div>
+            </div>
+            <div className="form-group">
+              <label>API URL</label>
+              <input
+                type="url"
+                value={apiUrl}
+                onChange={(e) => setApiUrl(e.target.value)}
+              />
+            </div>
           </>
         )}
+
+        {section === "sync" && (
+          <div className="form-group">
+            <label>Offline message bodies</label>
+            <small className="field-hint">
+              Your whole mailbox is always listed and searchable by subject,
+              sender and date. This only sets how many recent message{" "}
+              <em>bodies</em> are kept ready offline. Older ones load on demand
+              when you open them.
+            </small>
+            <label className="checkbox-field">
+              <input
+                type="checkbox"
+                checked={fetchAll}
+                onChange={(e) => setFetchAll(e.target.checked)}
+              />
+              <span>Keep every message body offline (full local copy)</span>
+            </label>
+            {fetchAll ? (
+              <small className="field-hint">
+                Downloads every body. Slowest option, and uses the most disk on
+                large accounts.
+              </small>
+            ) : (
+              <input
+                type="number"
+                min={1}
+                value={syncLimit}
+                onChange={(e) => setSyncLimit(Math.max(1, Number(e.target.value)))}
+                placeholder="Bodies to keep offline (most recent)"
+              />
+            )}
+          </div>
+        )}
+
+        {section === "ai" && (
+          <div className="form-group">
+            <label>AI access (MCP server)</label>
+            <small className="field-hint">
+              Lets an LLM client (Claude Desktop / Code) <strong>read</strong>{" "}
+              this mailbox over a local MCP server. It is strictly read-only and
+              can never send, move or delete mail.
+            </small>
+            <select
+              value={mcpPermission}
+              onChange={(e) => setMcpPermission(e.target.value as McpPermission)}
+            >
+              <option value="disabled">Disabled (off)</option>
+              <option value="metadata">
+                Metadata only (folders, search, headers)
+              </option>
+              <option value="full">Full read (includes message bodies)</option>
+            </select>
+            {mcpPermission === "full" && (
+              <small className="field-hint">
+                ⚠️ The connected LLM can read full message content. Body text is
+                untrusted, so a malicious email could try to mislead the model.
+                Only enable with a client you trust.
+              </small>
+            )}
+            {mcpPermission !== "disabled" && (
+              <>
+                <input
+                  type="number"
+                  value={mcpPort}
+                  onChange={(e) => setMcpPort(Number(e.target.value))}
+                  placeholder="MCP port (127.0.0.1)"
+                />
+                <button type="button" className="secondary" onClick={handleCopyMcpConfig}>
+                  {mcpCopied ? "Copied!" : "Copy client config"}
+                </button>
+                <small className="field-hint">
+                  Save first, then paste the copied snippet into your MCP
+                  client. The server listens on 127.0.0.1 and requires the
+                  bridge password as a bearer token.
+                </small>
+              </>
+            )}
+          </div>
+        )}
       </div>
 
-      {isRunning && (
-        <small className="field-hint">Changes apply after a restart.</small>
-      )}
       <div className="form-actions">
+        {isRunning && (
+          <small className="field-hint config-restart-hint">
+            Changes apply after a restart.
+          </small>
+        )}
         <button className="primary" onClick={handleSave} disabled={loading || !email}>
           {saved ? "Saved!" : "Save"}
         </button>
