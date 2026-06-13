@@ -60,9 +60,12 @@ export function useBridge() {
     // anything changes (mail count, ws state, start/stop). No setInterval.
     const unlistenStats = listen<BridgeStats>("bridge://stats", (e) => setStats(e.payload));
     const unlistenStatus = listen<BridgeStatus>("bridge://status", (e) => setStatus(e.payload));
+    // The login (still in progress) needs a 2FA code: show the field.
+    const unlistenTotp = listen("bridge://need-totp", () => setNeedsTotp(true));
     return () => {
       unlistenStats.then((fn) => fn());
       unlistenStatus.then((fn) => fn());
+      unlistenTotp.then((fn) => fn());
     };
   }, [refresh]);
 
@@ -105,33 +108,38 @@ export function useBridge() {
     setConfig(cfg);
   }, []);
 
+  // One login. If the account has 2FA, the backend emits `bridge://need-totp`
+  // mid-login and waits for `submitTotp`; this promise stays pending until then.
   const startBridge = useCallback(
-    async (password?: string, email?: string, totp?: string) => {
+    async (password?: string, email?: string) => {
       setLoading(true);
       setNeedsTotp(false);
       try {
         await invoke("start_bridge", {
           password: password || null,
           email: email || null,
-          totp: totp || null,
         });
+        setNeedsTotp(false);
         refresh();
         invoke<string | null>("get_bridge_password").then(setBridgePassword);
       } catch (e) {
-        const msg = String(e);
-        // Not a real error: the account has 2FA and we need the code. Surface a
-        // TOTP prompt instead of a scary error banner.
-        if (/2fa|totp/i.test(msg)) {
-          setNeedsTotp(true);
-        } else {
-          setStatus({ Error: msg });
-        }
+        setNeedsTotp(false);
+        setStatus({ Error: String(e) });
       } finally {
         setLoading(false);
       }
     },
     [refresh],
   );
+
+  // Deliver the 2FA code to the login that's currently waiting for it.
+  const submitTotp = useCallback(async (code: string) => {
+    try {
+      await invoke("submit_totp", { code });
+    } catch (e) {
+      setStatus({ Error: String(e) });
+    }
+  }, []);
 
   const stopBridge = useCallback(async () => {
     setLoading(true);
@@ -204,6 +212,7 @@ export function useBridge() {
     needsTotp,
     saveConfig,
     startBridge,
+    submitTotp,
     stopBridge,
     restartBridge,
     clearLogs,

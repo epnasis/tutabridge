@@ -76,6 +76,7 @@ function App() {
             logs={bridge.logs}
             needsTotp={bridge.needsTotp}
             onStart={bridge.startBridge}
+            onSubmitTotp={bridge.submitTotp}
             onStop={bridge.stopBridge}
             onClearLogs={bridge.clearLogs}
           />

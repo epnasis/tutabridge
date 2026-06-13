@@ -40,11 +40,17 @@ pub async fn has_saved_session() -> Result<bool, String> {
     Ok(tuta::has_saved_session(&cfg.email))
 }
 
+/// Holds the sender side of the channel the 2FA callback blocks on. `submit_totp`
+/// pushes the code here while a login is waiting for it. Kept separate from
+/// `BridgeState` so submitting the code never contends with the start lock.
+pub struct TotpState(pub std::sync::Mutex<Option<std::sync::mpsc::Sender<u32>>>);
+
 #[tauri::command]
 pub async fn start_bridge(
     email: Option<String>,
     password: Option<String>,
-    totp: Option<String>,
+    app: AppHandle,
+    totp_state: State<'_, TotpState>,
     state: State<'_, BridgeState>,
 ) -> Result<(), String> {
     let mut cfg = match config::load_config() {
@@ -68,14 +74,48 @@ pub async fn start_bridge(
     config::ensure_bridge_password(&mut cfg)
         .map_err(|e| format!("Bridge password setup failed: {e}"))?;
 
-    // If the user supplied a 2FA code, hand the login a callback that returns
-    // it. Without 2FA on the account this is simply never invoked.
-    let totp_cb = totp
-        .and_then(|c| c.trim().parse::<u32>().ok())
-        .map(|code| tuta::TwoFactorCallback::Totp(Box::new(move || Ok(code))));
+    // Interactive 2FA, like the CLI: a single login. The callback fires only if
+    // the account actually needs a code; it tells the UI to show the field
+    // (`bridge://need-totp`) and blocks until `submit_totp` delivers the code.
+    // One `initiate_session` either way, so it never trips Tuta's auth rate limit.
+    let (tx, rx) = std::sync::mpsc::channel::<u32>();
+    *totp_state.0.lock().unwrap() = Some(tx);
+    let rx = std::sync::Mutex::new(rx);
+    let app_for_cb = app.clone();
+    let totp_cb = tuta::TwoFactorCallback::Totp(Box::new(move || {
+        let _ = app_for_cb.emit("bridge://need-totp", ());
+        rx.lock()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(120))
+            .map_err(|_| {
+                Box::<dyn std::error::Error + Send + Sync>::from(
+                    "Two-factor code was not entered in time",
+                )
+            })
+    }));
 
-    let mut handle = state.lock().await;
-    handle.start(cfg, password, totp_cb).await
+    let result = {
+        let mut handle = state.lock().await;
+        handle.start(cfg, password, Some(totp_cb)).await
+    };
+    *totp_state.0.lock().unwrap() = None;
+    result
+}
+
+/// Deliver the 2FA code to a login currently waiting on it (see `start_bridge`).
+#[tauri::command]
+pub async fn submit_totp(code: String, totp_state: State<'_, TotpState>) -> Result<(), String> {
+    let parsed: u32 = code
+        .trim()
+        .parse()
+        .map_err(|_| "Two-factor code must be digits".to_string())?;
+    let tx = totp_state.0.lock().unwrap().clone();
+    match tx {
+        Some(tx) => tx
+            .send(parsed)
+            .map_err(|_| "No sign-in is waiting for a code".to_string()),
+        None => Err("No sign-in is waiting for a code".to_string()),
+    }
 }
 
 #[tauri::command]

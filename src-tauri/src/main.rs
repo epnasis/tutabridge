@@ -24,11 +24,13 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(shared as BridgeState)
+        .manage(commands::TotpState(std::sync::Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
             commands::get_config,
             commands::save_config,
             commands::has_saved_session,
             commands::start_bridge,
+            commands::submit_totp,
             commands::stop_bridge,
             commands::get_status,
             commands::get_stats,
@@ -104,12 +106,22 @@ async fn stream_stats(
     }
 
     emit_snapshot(&app, &state).await;
+
+    // A 1s tick alongside the dirty pulses. Pulses give instant updates on
+    // state changes (ws transitions, new mail); the tick keeps the time-based
+    // uptime climbing and self-heals any pulse the UI missed during startup
+    // (e.g. while the lock was held through an interactive 2FA wait).
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        match rx.recv().await {
-            Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                emit_snapshot(&app, &state).await;
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        tokio::select! {
+            r = rx.recv() => match r {
+                Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    emit_snapshot(&app, &state).await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            },
+            _ = tick.tick() => emit_snapshot(&app, &state).await,
         }
     }
 }
