@@ -143,7 +143,8 @@ pub async fn serve(
                 {
                     Ok(Ok(tls_stream)) => {
                         if let Err(e) =
-                            handle_connection(tls_stream, tuta, pw_hash, SmtpLimits::default()).await
+                            handle_connection(tls_stream, tuta, pw_hash, SmtpLimits::default())
+                                .await
                         {
                             error!("SMTP connection error: {}", e);
                         }
@@ -509,7 +510,10 @@ mod tests {
         assert!(size_param_exceeds("MAIL FROM:<a@b.com> size=30000000", max)); // case-insensitive
         assert!(!size_param_exceeds("MAIL FROM:<a@b.com> SIZE=1000", max));
         assert!(!size_param_exceeds("MAIL FROM:<a@b.com>", max)); // no SIZE param
-        assert!(!size_param_exceeds("MAIL FROM:<a@b.com> SIZE=notanumber", max));
+        assert!(!size_param_exceeds(
+            "MAIL FROM:<a@b.com> SIZE=notanumber",
+            max
+        ));
     }
 
     #[tokio::test]
@@ -672,9 +676,13 @@ mod tests {
         let backend = Arc::new(CountingBackend::default());
         let b = backend.clone();
         let h = tokio::spawn(async move {
-            let _ =
-                handle_connection(server, b as Arc<dyn MailBackend>, None, SmtpLimits::default())
-                    .await;
+            let _ = handle_connection(
+                server,
+                b as Arc<dyn MailBackend>,
+                None,
+                SmtpLimits::default(),
+            )
+            .await;
         });
 
         run_to_data(&mut client).await;

@@ -512,7 +512,10 @@ mod tests {
     #[test]
     fn qp_non_utf8_byte_is_decoded_not_echoed() {
         let out = decode_quoted_printable("caf=E9");
-        assert!(!out.contains("=E9"), "QP source must be decoded, not echoed");
+        assert!(
+            !out.contains("=E9"),
+            "QP source must be decoded, not echoed"
+        );
         assert!(out.starts_with("caf"), "got {out:?}");
     }
 

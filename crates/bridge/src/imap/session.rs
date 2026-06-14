@@ -1115,7 +1115,10 @@ fn append_first_token(args: &str) -> Option<String> {
 fn append_literal_size(args: &str) -> Option<usize> {
     let open = args.rfind('{')?;
     let close = args[open..].find('}')? + open;
-    args[open + 1..close].trim_end_matches('+').parse::<usize>().ok()
+    args[open + 1..close]
+        .trim_end_matches('+')
+        .parse::<usize>()
+        .ok()
 }
 
 #[cfg(test)]

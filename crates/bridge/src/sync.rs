@@ -458,7 +458,10 @@ pub async fn run_syncer(
                                     Ok(Some(rfc)) => {
                                         let text = extract_body_text(&rfc);
                                         if let Err(e) = ls.index_body(&meta.element_id, &text) {
-                                            warn!("FTS backfill failed for {}: {e}", meta.element_id);
+                                            warn!(
+                                                "FTS backfill failed for {}: {e}",
+                                                meta.element_id
+                                            );
                                             ok = false;
                                         } else {
                                             indexed += 1;
@@ -466,7 +469,10 @@ pub async fn run_syncer(
                                     }
                                     Ok(None) => {}
                                     Err(e) => {
-                                        warn!("FTS backfill read failed for {}: {e}", meta.element_id);
+                                        warn!(
+                                            "FTS backfill read failed for {}: {e}",
+                                            meta.element_id
+                                        );
                                         ok = false;
                                     }
                                 }

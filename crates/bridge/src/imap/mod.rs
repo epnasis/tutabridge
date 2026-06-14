@@ -40,7 +40,8 @@ pub async fn serve(
                 {
                     Ok(Ok(tls_stream)) => {
                         if let Err(e) =
-                            handle_connection(tls_stream, store, backend, local_store, pw_hash).await
+                            handle_connection(tls_stream, store, backend, local_store, pw_hash)
+                                .await
                         {
                             error!("IMAP connection error: {}", e);
                         }
