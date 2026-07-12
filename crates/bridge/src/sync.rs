@@ -1367,7 +1367,7 @@ mod tests {
     async fn set_labels_populates_registry_and_bumps_generation() {
         let store = MailStore::new();
         assert!(store.label_registry().await.is_empty());
-        let mut watch = store.subscribe();
+        let watch = store.subscribe();
         store
             .set_labels(vec![crate::labels::LabelInfo {
                 id: "l1".into(),

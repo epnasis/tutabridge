@@ -8,6 +8,7 @@
 //! principle: no API calls on the IMAP read path).
 
 use std::collections::{HashMap, HashSet};
+use tutasdk::{GeneratedId, IdTupleGenerated};
 
 /// A Tuta label (`MailSet` with `kind == Label`) as the bridge sees it.
 #[derive(Clone, Debug)]
@@ -15,12 +16,23 @@ pub struct LabelInfo {
     /// `MailSet` element id — the stable key `Mail.sets` references.
     pub id: String,
     /// `MailSet` list id — with `id` it forms the label's `IdTuple`, which
-    /// `ApplyLabelService` takes on the write path (phase 2).
+    /// `ApplyLabelService` takes on the write path.
     pub list_id: String,
     /// Display name as entered in the Tuta app, e.g. `Package Tracking`.
     pub name: String,
     /// `#rrggbb` display color (kept for the Apple Mail flag mapping, phase 4).
     pub color: Option<String>,
+}
+
+impl LabelInfo {
+    /// The label's full `IdTuple`, as `ApplyLabelService` and `Mail.sets`
+    /// reference it.
+    pub fn id_tuple(&self) -> IdTupleGenerated {
+        IdTupleGenerated::new(
+            GeneratedId(self.list_id.clone()),
+            GeneratedId(self.id.clone()),
+        )
+    }
 }
 
 /// One label with its assigned IMAP keyword atom.
@@ -37,6 +49,8 @@ pub struct LabelRegistry {
     entries: Vec<LabelEntry>,
     /// Label `MailSet` element id → index into `entries`.
     by_label_id: HashMap<String, usize>,
+    /// Lowercased keyword atom → index into `entries`.
+    by_keyword: HashMap<String, usize>,
 }
 
 impl LabelRegistry {
@@ -49,6 +63,7 @@ impl LabelRegistry {
 
         let mut entries: Vec<LabelEntry> = Vec::with_capacity(labels.len());
         let mut by_label_id = HashMap::with_capacity(labels.len());
+        let mut by_keyword = HashMap::with_capacity(labels.len());
         let mut used: HashSet<String> = HashSet::new();
         for info in labels {
             let base = sanitize_keyword(&info.name);
@@ -63,11 +78,13 @@ impl LabelRegistry {
                 keyword = format!("{base}_{n}");
             }
             by_label_id.insert(info.id.clone(), entries.len());
+            by_keyword.insert(keyword.to_ascii_lowercase(), entries.len());
             entries.push(LabelEntry { info, keyword });
         }
         Self {
             entries,
             by_label_id,
+            by_keyword,
         }
     }
 
@@ -83,6 +100,15 @@ impl LabelRegistry {
         self.by_label_id
             .get(label_element_id)
             .map(|&i| self.entries[i].keyword.as_str())
+    }
+
+    /// Label for a keyword atom a client sent in STORE. Case-insensitive:
+    /// flags compare case-insensitively per RFC 3501, and Thunderbird
+    /// lowercases every keyword it stores.
+    pub fn label_for_keyword(&self, keyword: &str) -> Option<&LabelInfo> {
+        self.by_keyword
+            .get(&keyword.to_ascii_lowercase())
+            .map(|&i| &self.entries[i].info)
     }
 
     pub fn entries(&self) -> &[LabelEntry] {
@@ -244,6 +270,25 @@ mod tests {
         assert_eq!(reg.keyword_for_label("a1"), Some("Zazalenia"));
         assert_eq!(reg.keyword_for_label("a2"), Some("zazalenia_2"));
         assert_eq!(reg.keyword_for_label("a3"), Some("Zazalenia_3"));
+    }
+
+    #[test]
+    fn keyword_lookup_is_case_insensitive() {
+        let reg = LabelRegistry::new(vec![label("l1", "Package Tracking")]);
+        // Thunderbird lowercases keywords; the exact advertised form and any
+        // other casing must resolve to the same label.
+        for kw in ["Package_Tracking", "package_tracking", "PACKAGE_TRACKING"] {
+            let info = reg.label_for_keyword(kw).expect(kw);
+            assert_eq!(info.id, "l1");
+        }
+        assert!(reg.label_for_keyword("unknown").is_none());
+        // The IdTuple is what ApplyLabelService consumes.
+        let tuple = reg
+            .label_for_keyword("package_tracking")
+            .unwrap()
+            .id_tuple();
+        assert_eq!(tuple.list_id.to_string(), "labels");
+        assert_eq!(tuple.element_id.to_string(), "l1");
     }
 
     #[test]

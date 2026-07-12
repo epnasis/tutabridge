@@ -11,12 +11,12 @@ use tutasdk::blobs::blob_facade::FileData;
 use tutasdk::crypto_entity_client::CryptoEntityClient;
 use tutasdk::entities::generated::sys::BlobReferenceTokenWrapper;
 use tutasdk::entities::generated::tutanota::{
-    AttachmentKeyData, DraftAttachment, DraftCreateData, DraftData, DraftRecipient, Mail, MailBox,
-    MailDetails, MailDetailsBlob, MailSet, MailSetEntry, NewDraftAttachment, SendDraftData,
-    SendDraftParameters, TutanotaFile,
+    ApplyLabelServicePostIn, AttachmentKeyData, DraftAttachment, DraftCreateData, DraftData,
+    DraftRecipient, Mail, MailBox, MailDetails, MailDetailsBlob, MailSet, MailSetEntry,
+    NewDraftAttachment, SendDraftData, SendDraftParameters, TutanotaFile,
 };
 use tutasdk::folder_system::{FolderSystem, MailSetKind};
-use tutasdk::services::generated::tutanota::{DraftService, SendDraftService};
+use tutasdk::services::generated::tutanota::{ApplyLabelService, DraftService, SendDraftService};
 use tutasdk::services::ExtraServiceParams;
 use tutasdk::tutanota_constants::ArchiveDataType;
 use tutasdk::{
@@ -95,6 +95,16 @@ pub trait MailBackend: Send + Sync {
         &self,
         mail_ids: Vec<IdTupleGenerated>,
         unread: bool,
+    ) -> Result<(), String>;
+    /// Add/remove existing labels on mails. The same `added`/`removed` label
+    /// IdTuples are applied to every mail in the batch (that is
+    /// `ApplyLabelService`'s shape); callers with per-mail differences make
+    /// one call per mail.
+    async fn apply_labels(
+        &self,
+        mail_ids: Vec<IdTupleGenerated>,
+        added: Vec<IdTupleGenerated>,
+        removed: Vec<IdTupleGenerated>,
     ) -> Result<(), String>;
     async fn trash_mails(&self, mail_ids: Vec<IdTupleGenerated>) -> Result<(), String>;
     /// Move mails into the given target folder.
@@ -934,6 +944,32 @@ impl MailBackend for TutaSession {
             .set_unread_status_for_mails(mail_ids, unread)
             .await
             .map_err(|e| format!("{e}"))
+    }
+
+    async fn apply_labels(
+        &self,
+        mail_ids: Vec<IdTupleGenerated>,
+        added: Vec<IdTupleGenerated>,
+        removed: Vec<IdTupleGenerated>,
+    ) -> Result<(), String> {
+        let executor = self.logged_in.get_service_executor();
+        // Same 50-mail server cap the SDK honors for its other mail-batch
+        // services (`MAX_MAIL_UPDATE_LIMIT`) — larger requests 400.
+        for chunk in mail_ids.chunks(50) {
+            executor
+                .post::<ApplyLabelService>(
+                    ApplyLabelServicePostIn {
+                        _format: 0,
+                        mails: chunk.to_vec(),
+                        addedLabels: added.clone(),
+                        removedLabels: removed.clone(),
+                    },
+                    ExtraServiceParams::default(),
+                )
+                .await
+                .map_err(|e| format!("{e}"))?;
+        }
+        Ok(())
     }
 
     async fn trash_mails(&self, mail_ids: Vec<IdTupleGenerated>) -> Result<(), String> {

@@ -399,6 +399,14 @@ mod tests {
         async fn list_labels(&self) -> Result<Vec<crate::labels::LabelInfo>, String> {
             Ok(Vec::new())
         }
+        async fn apply_labels(
+            &self,
+            _mail_ids: Vec<IdTupleGenerated>,
+            _added: Vec<IdTupleGenerated>,
+            _removed: Vec<IdTupleGenerated>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
         async fn load_mail_ids_for_folder(
             &self,
             folder: &FolderInfo,
