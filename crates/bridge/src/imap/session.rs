@@ -629,16 +629,15 @@ impl ImapSession {
             return vec![format!("{} BAD Invalid STORE arguments\r\n", tag)];
         };
         let indices = self.resolve_sequence_set(&store_args.seq_set, uid_mode);
-        let labels = self.store.label_registry().await;
+        let mut labels = self.store.label_registry().await;
 
         // Bucket the flag list: the system flags Tuta can express, keywords
-        // that map to labels, and the rest. \Answered / \Flagged / \Draft
-        // have no Tuta backing — accepted and dropped, as before. Unknown
-        // keywords would need label creation (a later phase): logged and
-        // skipped without failing the rest of the STORE.
+        // that map to labels, and unknown keywords. \Answered / \Flagged /
+        // \Draft have no Tuta backing — accepted and dropped, as before.
         let mut wants_seen = false;
         let mut wants_deleted = false;
-        let mut requested: Vec<&LabelInfo> = Vec::new();
+        let mut requested: Vec<LabelInfo> = Vec::new();
+        let mut unknown: Vec<String> = Vec::new();
         for flag in &store_args.flags {
             if flag.eq_ignore_ascii_case("\\Seen") {
                 wants_seen = true;
@@ -647,12 +646,52 @@ impl ImapSession {
             } else if flag.starts_with('\\') {
                 // System flag without Tuta backing.
             } else if let Some(info) = labels.label_for_keyword(flag) {
-                requested.push(info);
+                requested.push(info.clone());
             } else {
-                log::warn!(
-                    "STORE: ignoring unknown keyword {flag:?} (label creation not supported yet)"
-                );
+                unknown.push(flag.clone());
             }
+        }
+
+        // Unknown keywords create labels (we advertise `\*`) — but only when
+        // the STORE would add them; removing a keyword no label backs is a
+        // no-op. Only keywords the sanitizer maps back onto themselves are
+        // eligible: for any other name the created label's atom would differ
+        // from what the client stored, leaving a keyword that never matches.
+        if store_args.op != StoreOp::Remove && !unknown.is_empty() {
+            let mut created = false;
+            for kw in &unknown {
+                if crate::labels::sanitize_keyword(kw) != *kw {
+                    log::warn!(
+                        "STORE: not creating a label for keyword {kw:?} — \
+                         its atom would not round-trip"
+                    );
+                    continue;
+                }
+                match self
+                    .backend
+                    .create_label(kw, crate::labels::DEFAULT_LABEL_COLOR)
+                    .await
+                {
+                    Ok(fresh) => {
+                        log::info!("STORE: created Tuta label {kw:?} for new keyword");
+                        self.store.set_labels(fresh).await;
+                        created = true;
+                    }
+                    Err(e) => log::warn!("STORE: creating label {kw:?} failed: {e}"),
+                }
+            }
+            if created {
+                // Re-resolve against the refreshed registry so the new
+                // labels join this STORE's apply pass.
+                labels = self.store.label_registry().await;
+                for kw in &unknown {
+                    if let Some(info) = labels.label_for_keyword(kw) {
+                        requested.push(info.clone());
+                    }
+                }
+            }
+        } else if !unknown.is_empty() {
+            log::warn!("STORE: ignoring unknown keyword(s) {unknown:?} in -FLAGS");
         }
 
         // \Seen. Replace mode (bare FLAGS) derives the state from the
@@ -1055,11 +1094,12 @@ fn flags_advertisement(labels: &LabelRegistry) -> String {
 }
 
 /// PERMANENTFLAGS: what a client may STORE persistently. Label keywords are
-/// writable (STORE routes them to `ApplyLabelService`); `\*` stays absent
-/// until unknown keywords can create labels.
+/// writable (STORE routes them to `ApplyLabelService`), and `\*` tells
+/// clients they may invent new keywords — STORE creates the backing label.
 fn permanent_flags_advertisement(labels: &LabelRegistry) -> String {
     let mut flags = vec!["\\Seen", "\\Flagged"];
     flags.extend(labels.keywords());
+    flags.push("\\*");
     format!("* OK [PERMANENTFLAGS ({})] Limited\r\n", flags.join(" "))
 }
 
@@ -2042,6 +2082,8 @@ mod tests {
                 Vec<IdTupleGenerated>,
             )>,
         >,
+        /// Backend-side label list; `create_label` appends here.
+        labels: Mutex<Vec<crate::labels::LabelInfo>>,
         fail_details: Mutex<bool>,
     }
 
@@ -2055,6 +2097,7 @@ mod tests {
                 sent: Mutex::new(Vec::new()),
                 moved: Mutex::new(Vec::new()),
                 labels_applied: Mutex::new(Vec::new()),
+                labels: Mutex::new(Vec::new()),
                 fail_details: Mutex::new(false),
             }
         }
@@ -2271,9 +2314,8 @@ mod tests {
             flags.contains("\\Draft Package_Tracking Wazne"),
             "keywords must follow the system flags: {flags}"
         );
-        // Keywords are STOREable (they map to existing labels), but `\*`
-        // stays absent — clients may not invent new keywords until label
-        // creation is supported.
+        // Keywords are STOREable, and `\*` invites clients to invent new
+        // ones — STORE creates the backing label.
         let perm = resp
             .iter()
             .find(|r| r.contains("PERMANENTFLAGS"))
@@ -2282,7 +2324,7 @@ mod tests {
             perm.contains("Package_Tracking") && perm.contains("Wazne"),
             "keywords must be permanent: {perm}"
         );
-        assert!(!perm.contains("\\*"), "no \\* until label creation: {perm}");
+        assert!(perm.contains("\\*"), "\\* must be advertised: {perm}");
     }
 
     #[tokio::test]
@@ -2400,21 +2442,102 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_unknown_keyword_is_ignored_but_rest_applies() {
-        let backend = Arc::new(MockBackend::with_mails(vec![make_mail("e1", "s", true)]));
+    async fn store_unknown_keyword_creates_label_and_applies_it() {
+        let backend = Arc::new(MockBackend::with_mails(vec![make_mail("e1", "s", false)]));
         let (store, mut session) = make_session(backend.clone()).await;
-        store.set_labels(vec![test_label("l1", "Ephemeral")]).await;
         session.handle_command("a LOGIN u p").await;
         session.handle_command("b SELECT INBOX").await;
 
+        let resp = session.handle_command("c STORE 1 +FLAGS (ProjectX)").await;
+
+        // The label was created backend-side with the bridge default color…
+        {
+            let created = backend.labels.lock().unwrap();
+            assert_eq!(created.len(), 1);
+            assert_eq!(created[0].name, "ProjectX");
+            assert_eq!(created[0].color.as_deref(), Some(""));
+        }
+        // …applied to the mail in the same STORE…
+        {
+            let calls = backend.labels_applied.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].1[0].element_id.to_string(), "created_1");
+        }
+        // …reported in the untagged FETCH, and registered for future STOREs.
+        assert!(
+            resp[0].contains("FLAGS (\\Seen ProjectX)"),
+            "new keyword must be reported: {:?}",
+            resp[0]
+        );
+        let reg = store.label_registry().await;
+        assert_eq!(reg.label_for_keyword("projectx").unwrap().id, "created_1");
+    }
+
+    #[tokio::test]
+    async fn store_minus_unknown_keyword_does_not_create() {
+        let backend = Arc::new(MockBackend::with_mails(vec![make_mail("e1", "s", false)]));
+        let (_store, mut session) = make_session(backend.clone()).await;
+        session.handle_command("a LOGIN u p").await;
+        session.handle_command("b SELECT INBOX").await;
+
+        let resp = session.handle_command("c STORE 1 -FLAGS (Nope)").await;
+        assert!(resp.last().unwrap().contains("OK STORE"));
+        // Removing a keyword no label backs is a no-op, not a create.
+        assert!(backend.labels.lock().unwrap().is_empty());
+        assert!(backend.labels_applied.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn store_non_roundtripping_keyword_skipped_but_rest_applies() {
+        let backend = Arc::new(MockBackend::with_mails(vec![make_mail("e1", "s", true)]));
+        let (_store, mut session) = make_session(backend.clone()).await;
+        session.handle_command("a LOGIN u p").await;
+        session.handle_command("b SELECT INBOX").await;
+
+        // '&' sanitizes to '_', so the created label's atom would not match
+        // the stored keyword — the bridge must skip it, not create garbage.
         let resp = session
-            .handle_command("c STORE 1 +FLAGS (\\Seen NoSuchLabel)")
+            .handle_command("c STORE 1 +FLAGS (\\Seen No&Such)")
             .await;
 
         assert!(resp.last().unwrap().contains("OK STORE"));
-        // \Seen still applied, no label call for the unknown keyword.
         assert_eq!(backend.unread_calls.lock().unwrap().len(), 1);
+        assert!(backend.labels.lock().unwrap().is_empty());
         assert!(backend.labels_applied.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn label_rename_and_delete_refresh_keywords() {
+        let mut mail = make_mail("e1", "s", false);
+        mail.sets = vec![IdTupleGenerated::new(test_id("labels"), test_id("l1"))];
+        let backend = Arc::new(MockBackend::with_mails(vec![mail]));
+        let (store, mut session) = make_session(backend).await;
+        store.set_labels(vec![test_label("l1", "OldName")]).await;
+        session.handle_command("a LOGIN u p").await;
+        session.handle_command("b SELECT INBOX").await;
+
+        let resp = session.handle_command("c FETCH 1 (FLAGS)").await;
+        assert!(resp[0].contains("OldName"));
+
+        // Rename in the Tuta app arrives as a MailSet event → registry
+        // rebuild. Same label id, new atom.
+        store.set_labels(vec![test_label("l1", "NewName")]).await;
+        let resp = session.handle_command("d FETCH 1 (FLAGS)").await;
+        assert!(
+            resp[0].contains("NewName") && !resp[0].contains("OldName"),
+            "renamed label must swap atoms: {:?}",
+            resp[0]
+        );
+
+        // Delete: the keyword vanishes even though the mail's `sets` still
+        // carries the stale id until the Mail update event lands.
+        store.set_labels(Vec::new()).await;
+        let resp = session.handle_command("e FETCH 1 (FLAGS)").await;
+        assert!(
+            !resp[0].contains("NewName"),
+            "deleted label must disappear from FLAGS: {:?}",
+            resp[0]
+        );
     }
 
     #[tokio::test]
@@ -2645,7 +2768,22 @@ mod tests {
         async fn list_labels(&self) -> Result<Vec<crate::labels::LabelInfo>, String> {
             // Sessions read labels from the MailStore registry, never from
             // the backend — tests seed the store directly via `set_labels`.
-            Ok(Vec::new())
+            Ok(self.labels.lock().unwrap().clone())
+        }
+        async fn create_label(
+            &self,
+            name: &str,
+            color: &str,
+        ) -> Result<Vec<crate::labels::LabelInfo>, String> {
+            let mut labels = self.labels.lock().unwrap();
+            let id = format!("created_{}", labels.len() + 1);
+            labels.push(crate::labels::LabelInfo {
+                id,
+                list_id: "labels".to_string(),
+                name: name.to_string(),
+                color: Some(color.to_string()),
+            });
+            Ok(labels.clone())
         }
         async fn set_unread_status(
             &self,

@@ -120,6 +120,12 @@ impl LabelRegistry {
     }
 }
 
+/// Color for bridge-created labels. Empty means "no explicit color": the
+/// Tuta apps render it with their theme default — the exact value the app
+/// itself submits when the user creates a label without touching the color
+/// picker.
+pub const DEFAULT_LABEL_COLOR: &str = "";
+
 /// Turn a label display name into an IMAP keyword atom.
 ///
 /// Flag keywords are atoms (RFC 3501): ASCII, no spaces, parentheses,
@@ -127,7 +133,9 @@ impl LabelRegistry {
 /// deterministic — same name, same atom — and lossy on purpose: common Latin
 /// diacritics fold to ASCII, every other run of unrepresentable characters
 /// collapses into a single `_`. The registry disambiguates collisions, so
-/// lossiness here is cosmetic, not semantic.
+/// lossiness here is cosmetic, not semantic. `$` is kept: it is a valid atom
+/// character and the conventional keyword prefix — Thunderbird's built-in
+/// tags are `$label1`…`$label5`, and those must round-trip unchanged.
 pub fn sanitize_keyword(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     // A pending separator: set while skipping a run of unrepresentable
@@ -135,7 +143,7 @@ pub fn sanitize_keyword(name: &str) -> String {
     // that way atoms never start or end with the filler.
     let mut gap = false;
     for c in name.chars() {
-        let folded = if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+        let folded = if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '$') {
             None
         } else {
             match fold_diacritic(c) {
@@ -243,6 +251,14 @@ mod tests {
     fn sanitize_unrepresentable_falls_back() {
         assert_eq!(sanitize_keyword("📦"), "Label");
         assert_eq!(sanitize_keyword(""), "Label");
+    }
+
+    #[test]
+    fn sanitize_keeps_thunderbird_stock_tag_keywords() {
+        // TB's built-in tags STORE `$label1`…`$label5`; a lossy mapping here
+        // would break create-on-new-keyword for them.
+        assert_eq!(sanitize_keyword("$label1"), "$label1");
+        assert_eq!(sanitize_keyword("$Forwarded"), "$Forwarded");
     }
 
     #[test]

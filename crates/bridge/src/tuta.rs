@@ -13,10 +13,13 @@ use tutasdk::entities::generated::sys::BlobReferenceTokenWrapper;
 use tutasdk::entities::generated::tutanota::{
     ApplyLabelServicePostIn, AttachmentKeyData, DraftAttachment, DraftCreateData, DraftData,
     DraftRecipient, Mail, MailBox, MailDetails, MailDetailsBlob, MailSet, MailSetEntry,
-    NewDraftAttachment, SendDraftData, SendDraftParameters, TutanotaFile,
+    ManageLabelServiceLabelData, ManageLabelServicePostIn, NewDraftAttachment, SendDraftData,
+    SendDraftParameters, TutanotaFile,
 };
 use tutasdk::folder_system::{FolderSystem, MailSetKind};
-use tutasdk::services::generated::tutanota::{ApplyLabelService, DraftService, SendDraftService};
+use tutasdk::services::generated::tutanota::{
+    ApplyLabelService, DraftService, ManageLabelService, SendDraftService,
+};
 use tutasdk::services::ExtraServiceParams;
 use tutasdk::tutanota_constants::ArchiveDataType;
 use tutasdk::{
@@ -96,6 +99,11 @@ pub trait MailBackend: Send + Sync {
         mail_ids: Vec<IdTupleGenerated>,
         unread: bool,
     ) -> Result<(), String>;
+    /// Create a new label and return the fresh, complete label list.
+    /// `ManageLabelService` POST returns no id for the created `MailSet`,
+    /// so the backend re-enumerates — the caller uses the returned list to
+    /// refresh the registry and look the new label up by keyword.
+    async fn create_label(&self, name: &str, color: &str) -> Result<Vec<LabelInfo>, String>;
     /// Add/remove existing labels on mails. The same `added`/`removed` label
     /// IdTuples are applied to every mail in the batch (that is
     /// `ApplyLabelService`'s shape); callers with per-mail differences make
@@ -962,6 +970,56 @@ impl MailBackend for TutaSession {
             .set_unread_status_for_mails(mail_ids, unread)
             .await
             .map_err(|e| format!("{e}"))
+    }
+
+    async fn create_label(&self, name: &str, color: &str) -> Result<Vec<LabelInfo>, String> {
+        // Same envelope the draft path builds and TS `MailFacade.createLabel`
+        // uses: a fresh session key for the new entity, encrypted with the
+        // mail owner-group key at its current version. The executor encrypts
+        // the `data` aggregate's fields (name, color) with the session key.
+        let randomizer = RandomizerFacade::from_core(rand_core::OsRng);
+        let session_key: GenericAesKey = Aes256Key::generate(&randomizer).into();
+
+        let mail_group_id = self
+            .logged_in
+            .mail_facade()
+            .get_group_id_for_mail_address(&self.email)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        let group_key = self
+            .logged_in
+            .get_current_sym_group_key(&mail_group_id)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        let owner_enc_session_key = group_key
+            .object
+            .encrypt_key(&session_key, Iv::generate(&randomizer));
+
+        self.logged_in
+            .get_service_executor()
+            .post::<ManageLabelService>(
+                ManageLabelServicePostIn {
+                    _format: 0,
+                    ownerEncSessionKey: owner_enc_session_key,
+                    ownerKeyVersion: group_key.version as i64,
+                    ownerGroup: mail_group_id,
+                    data: ManageLabelServiceLabelData {
+                        _id: None,
+                        name: name.to_string(),
+                        color: color.to_string(),
+                        _errors: Default::default(),
+                    },
+                    _errors: Default::default(),
+                },
+                ExtraServiceParams {
+                    session_key: Some(session_key),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| format!("{e}"))?;
+
+        self.list_labels().await
     }
 
     async fn apply_labels(
