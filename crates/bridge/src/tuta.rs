@@ -188,11 +188,37 @@ impl TutaSession {
         self.logged_in.mail_facade().load_user_mailbox().await
     }
 
-    pub async fn load_folders(&self, mailbox: &MailBox) -> Result<FolderSystem, ApiCallError> {
-        self.logged_in
+    /// Load the mailbox's `MailSet` list (folders + labels), decrypting per
+    /// entity: one broken MailSet — e.g. written by a buggy client — must
+    /// never blind the whole folder/label enumeration. Broken entries are
+    /// logged with their id (so they can be deleted server-side) and skipped.
+    pub async fn load_mail_sets_tolerant(
+        &self,
+        mailbox: &MailBox,
+    ) -> Result<Vec<MailSet>, ApiCallError> {
+        // Same list + limit `load_folders_for_mailbox` uses.
+        let items = self
+            .logged_in
             .mail_facade()
-            .load_folders_for_mailbox(mailbox)
-            .await
+            .get_crypto_entity_client()
+            .load_range_tolerant::<MailSet, GeneratedId>(
+                &mailbox.mailSets.mailSets,
+                &GeneratedId::min_id(),
+                100,
+                ListLoadDirection::ASC,
+            )
+            .await?;
+        let mut sets = Vec::with_capacity(items.len());
+        for item in items {
+            match item.result {
+                Ok(set) => sets.push(set),
+                Err(e) => log::warn!(
+                    "Skipping undecryptable MailSet {:?} — delete it in the Tuta app to clean up: {e}",
+                    item.id.map(|id| (id.list_id.to_string(), id.element_id.to_string())),
+                ),
+            }
+        }
+        Ok(sets)
     }
 
     pub fn user_id(&self) -> Option<String> {
@@ -847,10 +873,11 @@ impl MailBackend for TutaSession {
 
     async fn list_folders(&self) -> Result<Vec<FolderInfo>, String> {
         let mailbox = self.load_mailbox().await.map_err(|e| format!("{e}"))?;
-        let folder_system = self
-            .load_folders(&mailbox)
-            .await
-            .map_err(|e| format!("{e}"))?;
+        let folder_system = FolderSystem::new(
+            self.load_mail_sets_tolerant(&mailbox)
+                .await
+                .map_err(|e| format!("{e}"))?,
+        );
 
         let mut result = Vec::new();
         for indented in folder_system.indented_list() {
@@ -903,18 +930,9 @@ impl MailBackend for TutaSession {
         let mailbox = self.load_mailbox().await.map_err(|e| format!("{e}"))?;
         // Labels live in the same `mailSets` list as folders, but the SDK's
         // `FolderSystem` silently drops every `MailSet` that is neither a
-        // visible system folder nor `Custom` — so we load the raw range
-        // ourselves (same list, same limit as `load_folders_for_mailbox`).
-        let sets: Vec<MailSet> = self
-            .logged_in
-            .mail_facade()
-            .get_crypto_entity_client()
-            .load_range(
-                &mailbox.mailSets.mailSets,
-                &GeneratedId::min_id(),
-                100,
-                ListLoadDirection::ASC,
-            )
+        // visible system folder nor `Custom` — so we walk the raw list.
+        let sets = self
+            .load_mail_sets_tolerant(&mailbox)
             .await
             .map_err(|e| format!("{e}"))?;
 
