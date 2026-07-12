@@ -244,6 +244,9 @@ mod tests {
         async fn list_folders(&self) -> Result<Vec<FolderInfo>, String> {
             unimplemented!()
         }
+        async fn list_labels(&self) -> Result<Vec<crate::labels::LabelInfo>, String> {
+            unimplemented!()
+        }
         async fn set_unread_status(
             &self,
             _ids: Vec<IdTupleGenerated>,

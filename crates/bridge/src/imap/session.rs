@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tutasdk::entities::generated::tutanota::{Mail, MailAddress, MailDetails, TutanotaFile};
 
 use crate::imap::search::{self, MsgView};
+use crate::labels::LabelRegistry;
 use crate::mail::mail_to_rfc2822;
 use crate::mail::rfc2822::{extract_headers, format_address, format_internal_date};
 use crate::store::LocalStore;
@@ -176,13 +177,18 @@ impl ImapSession {
             })
             .count();
 
-        if expunges.is_empty() && added == 0 && new_list.len() == self.mails.len() {
+        let membership_changed =
+            !expunges.is_empty() || added > 0 || new_list.len() != self.mails.len();
+
+        // Apply the new view even when there is nothing to signal: flag-level
+        // changes (read/unread toggles, label membership) alter no message
+        // ids, but this session's next FETCH must still see them. RFC 3501:
+        // EXPUNGEs go in descending seqno order so subsequent values are not
+        // shifted.
+        let _ = self.refresh_mails(&folder.id).await;
+        if !membership_changed {
             return vec![];
         }
-
-        // Apply the new view, then notify. RFC 3501: EXPUNGEs go in
-        // descending seqno order so subsequent values are not shifted.
-        let _ = self.refresh_mails(&folder.id).await;
 
         let mut responses = Vec::with_capacity(expunges.len() + 1);
         expunges.sort_unstable_by(|a, b| b.cmp(a));
@@ -333,10 +339,14 @@ impl ImapSession {
                     .map(|i| i + 1)
                     .unwrap_or(0);
 
+                let labels = self.store.label_registry().await;
                 let mut resp = vec![
                     format!("* {} EXISTS\r\n", count),
                     "* 0 RECENT\r\n".to_string(),
-                    "* FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)\r\n".to_string(),
+                    flags_advertisement(&labels),
+                    // Keywords stay out of PERMANENTFLAGS for now — they are
+                    // read-only until the STORE write path lands, and this
+                    // tells well-behaved clients not to try setting them.
                     "* OK [PERMANENTFLAGS (\\Seen \\Flagged)] Limited\r\n".to_string(),
                     "* OK [UIDVALIDITY 1] UIDs valid\r\n".to_string(),
                     format!("* OK [UIDNEXT {}] Predicted next UID\r\n", self.uid_next),
@@ -386,6 +396,9 @@ impl ImapSession {
 
         let (seq_set, items) = parse_fetch_args(args);
         let indices = self.resolve_sequence_set(&seq_set, uid_mode);
+        // One registry snapshot per FETCH command: label keywords in the
+        // FLAGS items stay consistent across the whole response.
+        let labels = self.store.label_registry().await;
 
         let mut responses = Vec::new();
 
@@ -488,7 +501,7 @@ impl ImapSession {
 
             let cached = &self.mails[idx];
             let seq = idx + 1;
-            let resp = build_fetch_response(seq, cached, &items, uid_mode);
+            let resp = build_fetch_response(seq, cached, &items, uid_mode, &labels);
             responses.push(resp);
         }
 
@@ -896,7 +909,22 @@ fn join_addrs(addrs: &[MailAddress]) -> String {
         .join(", ")
 }
 
-fn build_fetch_response(seq: usize, cached: &CachedMail, items: &str, uid_mode: bool) -> String {
+/// The untagged FLAGS advertisement: the fixed system flags plus one keyword
+/// per Tuta label. One helper so SELECT and (later) STORE's untagged FETCH
+/// responses can never drift apart.
+fn flags_advertisement(labels: &LabelRegistry) -> String {
+    let mut flags = vec!["\\Seen", "\\Answered", "\\Flagged", "\\Deleted", "\\Draft"];
+    flags.extend(labels.keywords());
+    format!("* FLAGS ({})\r\n", flags.join(" "))
+}
+
+fn build_fetch_response(
+    seq: usize,
+    cached: &CachedMail,
+    items: &str,
+    uid_mode: bool,
+    labels: &LabelRegistry,
+) -> String {
     let items_upper = items.to_uppercase();
     let mut parts = Vec::new();
 
@@ -911,6 +939,14 @@ fn build_fetch_response(seq: usize, cached: &CachedMail, items: &str, uid_mode: 
         }
         if cached.deleted {
             flags.push("\\Deleted");
+        }
+        // `Mail.sets` lists every MailSet the mail belongs to — its folder
+        // and its labels. Only label ids resolve in the registry; the folder
+        // id is skipped by the lookup.
+        for set in &cached.mail.sets {
+            if let Some(keyword) = labels.keyword_for_label(set.element_id.0.as_str()) {
+                flags.push(keyword);
+            }
         }
         parts.push(format!("FLAGS ({})", flags.join(" ")));
     }
@@ -1463,21 +1499,21 @@ mod tests {
     #[test]
     fn test_build_fetch_response_flags_only() {
         let cached = make_test_mail(1, "Test", false);
-        let resp = build_fetch_response(1, &cached, "(FLAGS)", false);
+        let resp = build_fetch_response(1, &cached, "(FLAGS)", false, &LabelRegistry::default());
         assert_eq!(resp, "* 1 FETCH (FLAGS (\\Seen))\r\n");
     }
 
     #[test]
     fn test_build_fetch_response_flags_unread() {
         let cached = make_test_mail(1, "Test", true);
-        let resp = build_fetch_response(1, &cached, "(FLAGS)", false);
+        let resp = build_fetch_response(1, &cached, "(FLAGS)", false, &LabelRegistry::default());
         assert_eq!(resp, "* 1 FETCH (FLAGS ())\r\n");
     }
 
     #[test]
     fn test_build_fetch_response_uid_mode() {
         let cached = make_test_mail(42, "Test", false);
-        let resp = build_fetch_response(3, &cached, "(FLAGS)", true);
+        let resp = build_fetch_response(3, &cached, "(FLAGS)", true, &LabelRegistry::default());
         assert!(resp.contains("UID 42"));
         assert!(resp.contains("FLAGS (\\Seen)"));
     }
@@ -1485,14 +1521,26 @@ mod tests {
     #[test]
     fn test_build_fetch_response_internaldate() {
         let cached = make_test_mail(1, "Test", false);
-        let resp = build_fetch_response(1, &cached, "(INTERNALDATE)", false);
+        let resp = build_fetch_response(
+            1,
+            &cached,
+            "(INTERNALDATE)",
+            false,
+            &LabelRegistry::default(),
+        );
         assert!(resp.contains("INTERNALDATE \"25-Dec-2024 12:37:25 +0000\""));
     }
 
     #[test]
     fn test_build_fetch_response_rfc822_size() {
         let cached = make_test_mail(1, "Test", false);
-        let resp = build_fetch_response(1, &cached, "(RFC822.SIZE)", false);
+        let resp = build_fetch_response(
+            1,
+            &cached,
+            "(RFC822.SIZE)",
+            false,
+            &LabelRegistry::default(),
+        );
         let rfc_len = cached.rfc2822.as_ref().unwrap().len();
         assert!(resp.contains(&format!("RFC822.SIZE {}", rfc_len)));
     }
@@ -1500,7 +1548,7 @@ mod tests {
     #[test]
     fn test_build_fetch_response_envelope() {
         let cached = make_test_mail(1, "Hello World", false);
-        let resp = build_fetch_response(1, &cached, "(ENVELOPE)", false);
+        let resp = build_fetch_response(1, &cached, "(ENVELOPE)", false, &LabelRegistry::default());
         assert!(resp.contains("ENVELOPE"));
         assert!(resp.contains("Hello World"));
         assert!(resp.contains("\"sender\" \"tuta.com\""));
@@ -1509,7 +1557,13 @@ mod tests {
     #[test]
     fn test_build_fetch_response_body_peek() {
         let cached = make_test_mail(1, "Test", false);
-        let resp = build_fetch_response(1, &cached, "(BODY.PEEK[])", false);
+        let resp = build_fetch_response(
+            1,
+            &cached,
+            "(BODY.PEEK[])",
+            false,
+            &LabelRegistry::default(),
+        );
         assert!(resp.contains("BODY[] {"));
         assert!(resp.contains("From: sender@tuta.com"));
     }
@@ -1517,7 +1571,7 @@ mod tests {
     #[test]
     fn test_build_fetch_response_rfc822_full() {
         let cached = make_test_mail(1, "Test", false);
-        let resp = build_fetch_response(1, &cached, "(RFC822)", false);
+        let resp = build_fetch_response(1, &cached, "(RFC822)", false, &LabelRegistry::default());
         assert!(resp.contains("RFC822 {"));
         assert!(resp.contains("From: sender@tuta.com"));
     }
@@ -1607,7 +1661,13 @@ mod tests {
     #[test]
     fn test_build_fetch_response_multiple_items() {
         let cached = make_test_mail(5, "Multi", true);
-        let resp = build_fetch_response(3, &cached, "(FLAGS UID INTERNALDATE)", false);
+        let resp = build_fetch_response(
+            3,
+            &cached,
+            "(FLAGS UID INTERNALDATE)",
+            false,
+            &LabelRegistry::default(),
+        );
         assert!(resp.starts_with("* 3 FETCH ("));
         assert!(resp.contains("FLAGS ()"));
         assert!(resp.contains("UID 5"));
@@ -1652,7 +1712,7 @@ mod tests {
     #[test]
     fn test_build_envelope_subject_with_quotes() {
         let cached = make_test_mail(1, "Re: \"Important\" stuff", false);
-        let resp = build_fetch_response(1, &cached, "(ENVELOPE)", false);
+        let resp = build_fetch_response(1, &cached, "(ENVELOPE)", false, &LabelRegistry::default());
         assert!(resp.contains("\\\"Important\\\""));
         assert!(!resp.contains("\"\"Important\"\""));
     }
@@ -1669,6 +1729,7 @@ mod tests {
             &cached,
             "(BODY.PEEK[HEADER.FIELDS (date subject from x-priority x-universally-unique-identifier)])",
             false,
+            &LabelRegistry::default(),
         );
         assert!(
             resp.contains(
@@ -1710,10 +1771,22 @@ mod tests {
     #[test]
     fn bare_header_fetch_returns_all_headers() {
         let cached = make_test_mail(1, "Test", false);
-        let resp = build_fetch_response(1, &cached, "(BODY.PEEK[HEADER])", false);
+        let resp = build_fetch_response(
+            1,
+            &cached,
+            "(BODY.PEEK[HEADER])",
+            false,
+            &LabelRegistry::default(),
+        );
         assert!(resp.contains("BODY[HEADER] {"), "got: {resp}");
         assert!(resp.contains("Subject: Test"));
-        let resp = build_fetch_response(1, &cached, "(RFC822.HEADER)", false);
+        let resp = build_fetch_response(
+            1,
+            &cached,
+            "(RFC822.HEADER)",
+            false,
+            &LabelRegistry::default(),
+        );
         assert!(resp.contains("RFC822.HEADER {"), "got: {resp}");
     }
 
@@ -1957,6 +2030,110 @@ mod tests {
         assert!(!session.append_targets_sent("Nonexistent").await);
     }
 
+    fn test_label(id: &str, name: &str) -> crate::labels::LabelInfo {
+        crate::labels::LabelInfo {
+            id: id.to_string(),
+            list_id: "labels".to_string(),
+            name: name.to_string(),
+            color: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn select_advertises_label_keywords_but_not_permanent() {
+        let backend = Arc::new(MockBackend::with_mails(vec![make_mail("e1", "s", true)]));
+        let (store, mut session) = make_session(backend).await;
+        store
+            .set_labels(vec![
+                test_label("l1", "Package Tracking"),
+                test_label("l2", "Ważne"),
+            ])
+            .await;
+        session.handle_command("a LOGIN u p").await;
+        let resp = session.handle_command("b SELECT INBOX").await;
+
+        let flags = resp
+            .iter()
+            .find(|r| r.starts_with("* FLAGS"))
+            .expect("SELECT must advertise FLAGS");
+        assert!(
+            flags.contains("\\Draft Package_Tracking Wazne"),
+            "keywords must follow the system flags: {flags}"
+        );
+        // Read-only phase: clients must not be told they can STORE keywords.
+        let perm = resp
+            .iter()
+            .find(|r| r.contains("PERMANENTFLAGS"))
+            .expect("SELECT must advertise PERMANENTFLAGS");
+        assert!(
+            !perm.contains("Package_Tracking") && !perm.contains("\\*"),
+            "keywords must stay out of PERMANENTFLAGS: {perm}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_flags_includes_keywords_for_labeled_mails_only() {
+        let mut labeled = make_mail("e1", "labeled", false);
+        labeled.sets = vec![
+            // The mail's folder also appears in `sets` — it must not leak
+            // into FLAGS as a keyword.
+            IdTupleGenerated::new(test_id("folders"), test_id("inbox")),
+            IdTupleGenerated::new(test_id("labels"), test_id("l1")),
+        ];
+        let plain = make_mail("e2", "plain", false);
+        let backend = Arc::new(MockBackend::with_mails(vec![labeled, plain]));
+        let (store, mut session) = make_session(backend).await;
+        store.set_labels(vec![test_label("l1", "Ephemeral")]).await;
+        session.handle_command("a LOGIN u p").await;
+        session.handle_command("b SELECT INBOX").await;
+
+        let resp = session.handle_command("c FETCH 1:2 (FLAGS)").await;
+        assert!(
+            resp[0].contains("FLAGS (\\Seen Ephemeral)"),
+            "labeled mail must carry its keyword: {:?}",
+            resp[0]
+        );
+        assert!(
+            resp[1].contains("FLAGS (\\Seen)") && !resp[1].contains("Ephemeral"),
+            "unlabeled mail must be unchanged: {:?}",
+            resp[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn label_change_in_store_is_visible_after_idle_wakeup() {
+        // A label applied in the Tuta app arrives as a Mail UPDATE event:
+        // the event handler refreshes the mail in the MailStore and bumps
+        // the generation, the connection loop calls `check_new_mail`. The
+        // session must fold the new `sets` in even though no mail was added
+        // or removed.
+        let mail = make_mail("e1", "s", false);
+        let backend = Arc::new(MockBackend::with_mails(vec![mail.clone()]));
+        let (store, mut session) = make_session(backend).await;
+        store.set_labels(vec![test_label("l1", "Ephemeral")]).await;
+        session.handle_command("a LOGIN u p").await;
+        session.handle_command("b SELECT INBOX").await;
+
+        let before = session.handle_command("c FETCH 1 (FLAGS)").await;
+        assert!(!before[0].contains("Ephemeral"));
+
+        let mut updated = mail;
+        updated.sets = vec![IdTupleGenerated::new(test_id("labels"), test_id("l1"))];
+        store.refresh_mail_in_place(&updated).await;
+        let signals = session.check_new_mail().await;
+        assert!(
+            signals.is_empty(),
+            "no EXISTS/EXPUNGE for a flags-only change"
+        );
+
+        let after = session.handle_command("d FETCH 1 (FLAGS)").await;
+        assert!(
+            after[0].contains("Ephemeral"),
+            "label set in the store must reach the session view: {:?}",
+            after[0]
+        );
+    }
+
     async fn populate_store(store: &MailStore, mails: &[Mail]) {
         store.set_folder_list(vec![inbox_folder()]).await;
         let stored: Vec<StoredMail> = mails
@@ -2053,6 +2230,11 @@ mod tests {
         }
         async fn list_folders(&self) -> Result<Vec<FolderInfo>, String> {
             Ok(vec![inbox_folder()])
+        }
+        async fn list_labels(&self) -> Result<Vec<crate::labels::LabelInfo>, String> {
+            // Sessions read labels from the MailStore registry, never from
+            // the backend — tests seed the store directly via `set_labels`.
+            Ok(Vec::new())
         }
         async fn set_unread_status(
             &self,

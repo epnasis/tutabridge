@@ -6,6 +6,7 @@ use log::{debug, info, warn};
 use tokio::sync::{watch, RwLock};
 use tutasdk::entities::generated::tutanota::{Mail, MailDetails, TutanotaFile};
 
+use crate::labels::{LabelInfo, LabelRegistry};
 use crate::mail::{extract_body_text, mail_to_rfc2822, strip_html};
 use crate::store::{LocalStore, MailMetadata};
 use crate::tuta::{FolderInfo, MailBackend};
@@ -38,6 +39,8 @@ pub struct MailStore {
     folders: RwLock<HashMap<String, Vec<StoredMail>>>,
     /// The folder list (system + custom), for IMAP enumeration.
     folder_list: RwLock<Vec<FolderInfo>>,
+    /// Label ↔ IMAP keyword registry, refreshed alongside the folder list.
+    labels: RwLock<LabelRegistry>,
     generation: watch::Sender<u64>,
     gen_counter: std::sync::atomic::AtomicU64,
     /// element_id -> instant until which an on-demand body fetch is skipped,
@@ -51,6 +54,7 @@ impl MailStore {
         Arc::new(Self {
             folders: RwLock::new(HashMap::new()),
             folder_list: RwLock::new(Vec::new()),
+            labels: RwLock::new(LabelRegistry::default()),
             generation: tx,
             gen_counter: std::sync::atomic::AtomicU64::new(0),
             body_fetch_cooldown: Mutex::new(HashMap::new()),
@@ -140,6 +144,18 @@ impl MailStore {
 
     pub(crate) async fn set_folder_list(&self, folders: Vec<FolderInfo>) {
         *self.folder_list.write().await = folders;
+        self.bump_generation();
+    }
+
+    /// Snapshot of the label ↔ keyword registry. The IMAP layer takes one
+    /// per command, so a mid-command registry refresh cannot skew a response.
+    pub async fn label_registry(&self) -> LabelRegistry {
+        self.labels.read().await.clone()
+    }
+
+    /// Replace the label registry from a fresh backend enumeration.
+    pub(crate) async fn set_labels(&self, labels: Vec<LabelInfo>) {
+        *self.labels.write().await = LabelRegistry::new(labels);
         self.bump_generation();
     }
 
@@ -399,6 +415,15 @@ pub async fn run_syncer(
         }
     };
     store.set_folder_list(folders.clone()).await;
+
+    // Labels ride the same server-side MailSets list as folders but never
+    // appear in the IMAP mailbox tree — they feed the keyword registry
+    // instead. Failure is not fatal: mail sync works without labels, the
+    // keywords just stay absent until the next MailSet event refresh.
+    match retry(|| backend.list_labels()).await {
+        Ok(labels) => store.set_labels(labels).await,
+        Err(e) => warn!("Could not load label list: {e}"),
+    }
 
     // Phase 0: load cached mails from the local store into memory.
     for folder in &folders {
@@ -1336,6 +1361,26 @@ mod tests {
             .upsert_mail_in_folder("A", stored(make_mail("L1", "e2", "two", true), 2))
             .await;
         assert_eq!(store.get_folder("A").await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn set_labels_populates_registry_and_bumps_generation() {
+        let store = MailStore::new();
+        assert!(store.label_registry().await.is_empty());
+        let mut watch = store.subscribe();
+        store
+            .set_labels(vec![crate::labels::LabelInfo {
+                id: "l1".into(),
+                list_id: "labels".into(),
+                name: "Package Tracking".into(),
+                color: Some("#ff0000".into()),
+            }])
+            .await;
+        // IDLE sessions wait on the generation channel; a registry change
+        // must wake them like any other store mutation.
+        assert!(watch.has_changed().unwrap());
+        let reg = store.label_registry().await;
+        assert_eq!(reg.keyword_for_label("l1"), Some("Package_Tracking"));
     }
 
     #[tokio::test]

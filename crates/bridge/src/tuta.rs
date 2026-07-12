@@ -12,16 +12,19 @@ use tutasdk::crypto_entity_client::CryptoEntityClient;
 use tutasdk::entities::generated::sys::BlobReferenceTokenWrapper;
 use tutasdk::entities::generated::tutanota::{
     AttachmentKeyData, DraftAttachment, DraftCreateData, DraftData, DraftRecipient, Mail, MailBox,
-    MailDetails, MailDetailsBlob, MailSetEntry, NewDraftAttachment, SendDraftData,
+    MailDetails, MailDetailsBlob, MailSet, MailSetEntry, NewDraftAttachment, SendDraftData,
     SendDraftParameters, TutanotaFile,
 };
 use tutasdk::folder_system::{FolderSystem, MailSetKind};
 use tutasdk::services::generated::tutanota::{DraftService, SendDraftService};
 use tutasdk::services::ExtraServiceParams;
 use tutasdk::tutanota_constants::ArchiveDataType;
-use tutasdk::{ApiCallError, CustomId, IdTupleGenerated, ListLoadDirection, LoggedInSdk, Sdk};
+use tutasdk::{
+    ApiCallError, CustomId, GeneratedId, IdTupleGenerated, ListLoadDirection, LoggedInSdk, Sdk,
+};
 
 use crate::config::Config;
+use crate::labels::LabelInfo;
 use crate::mail::ParsedMessage;
 
 /// A mail folder as seen by the bridge, keyed by its stable Tuta `MailSet`
@@ -84,6 +87,10 @@ pub trait MailBackend: Send + Sync {
     async fn load_attachments(&self, mail: &Mail) -> Result<Vec<(TutanotaFile, Vec<u8>)>, String>;
     /// Enumerate all mail folders (system + custom, with hierarchy).
     async fn list_folders(&self) -> Result<Vec<FolderInfo>, String>;
+    /// Enumerate the account's labels (`MailSet`s with `kind == Label`).
+    /// Kept separate from `list_folders` — labels never appear in the IMAP
+    /// mailbox tree; they surface as keywords instead.
+    async fn list_labels(&self) -> Result<Vec<LabelInfo>, String>;
     async fn set_unread_status(
         &self,
         mail_ids: Vec<IdTupleGenerated>,
@@ -880,6 +887,41 @@ impl MailBackend for TutaSession {
             });
         }
         Ok(result)
+    }
+
+    async fn list_labels(&self) -> Result<Vec<LabelInfo>, String> {
+        let mailbox = self.load_mailbox().await.map_err(|e| format!("{e}"))?;
+        // Labels live in the same `mailSets` list as folders, but the SDK's
+        // `FolderSystem` silently drops every `MailSet` that is neither a
+        // visible system folder nor `Custom` — so we load the raw range
+        // ourselves (same list, same limit as `load_folders_for_mailbox`).
+        let sets: Vec<MailSet> = self
+            .logged_in
+            .mail_facade()
+            .get_crypto_entity_client()
+            .load_range(
+                &mailbox.mailSets.mailSets,
+                &GeneratedId::min_id(),
+                100,
+                ListLoadDirection::ASC,
+            )
+            .await
+            .map_err(|e| format!("{e}"))?;
+
+        let mut labels = Vec::new();
+        for set in sets {
+            if set.mail_set_kind() != MailSetKind::Label {
+                continue;
+            }
+            let Some(id) = set._id.as_ref() else { continue };
+            labels.push(LabelInfo {
+                id: id.element_id.to_string(),
+                list_id: id.list_id.to_string(),
+                name: set.name.clone(),
+                color: set.color.clone(),
+            });
+        }
+        Ok(labels)
     }
 
     async fn set_unread_status(
