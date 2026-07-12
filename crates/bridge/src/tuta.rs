@@ -11,12 +11,15 @@ use tutasdk::blobs::blob_facade::FileData;
 use tutasdk::crypto_entity_client::CryptoEntityClient;
 use tutasdk::entities::generated::sys::BlobReferenceTokenWrapper;
 use tutasdk::entities::generated::tutanota::{
-    AttachmentKeyData, DraftAttachment, DraftCreateData, DraftData, DraftRecipient, Mail, MailBox,
-    MailDetails, MailDetailsBlob, MailSet, MailSetEntry, NewDraftAttachment, SendDraftData,
+    ApplyLabelServicePostIn, AttachmentKeyData, DraftAttachment, DraftCreateData, DraftData,
+    DraftRecipient, Mail, MailBox, MailDetails, MailDetailsBlob, MailSet, MailSetEntry,
+    ManageLabelServiceLabelData, ManageLabelServicePostIn, NewDraftAttachment, SendDraftData,
     SendDraftParameters, TutanotaFile,
 };
 use tutasdk::folder_system::{FolderSystem, MailSetKind};
-use tutasdk::services::generated::tutanota::{DraftService, SendDraftService};
+use tutasdk::services::generated::tutanota::{
+    ApplyLabelService, DraftService, ManageLabelService, SendDraftService,
+};
 use tutasdk::services::ExtraServiceParams;
 use tutasdk::tutanota_constants::ArchiveDataType;
 use tutasdk::{
@@ -95,6 +98,21 @@ pub trait MailBackend: Send + Sync {
         &self,
         mail_ids: Vec<IdTupleGenerated>,
         unread: bool,
+    ) -> Result<(), String>;
+    /// Create a new label and return the fresh, complete label list.
+    /// `ManageLabelService` POST returns no id for the created `MailSet`,
+    /// so the backend re-enumerates — the caller uses the returned list to
+    /// refresh the registry and look the new label up by keyword.
+    async fn create_label(&self, name: &str, color: &str) -> Result<Vec<LabelInfo>, String>;
+    /// Add/remove existing labels on mails. The same `added`/`removed` label
+    /// IdTuples are applied to every mail in the batch (that is
+    /// `ApplyLabelService`'s shape); callers with per-mail differences make
+    /// one call per mail.
+    async fn apply_labels(
+        &self,
+        mail_ids: Vec<IdTupleGenerated>,
+        added: Vec<IdTupleGenerated>,
+        removed: Vec<IdTupleGenerated>,
     ) -> Result<(), String>;
     async fn trash_mails(&self, mail_ids: Vec<IdTupleGenerated>) -> Result<(), String>;
     /// Move mails into the given target folder.
@@ -178,11 +196,37 @@ impl TutaSession {
         self.logged_in.mail_facade().load_user_mailbox().await
     }
 
-    pub async fn load_folders(&self, mailbox: &MailBox) -> Result<FolderSystem, ApiCallError> {
-        self.logged_in
+    /// Load the mailbox's `MailSet` list (folders + labels), decrypting per
+    /// entity: one broken MailSet — e.g. written by a buggy client — must
+    /// never blind the whole folder/label enumeration. Broken entries are
+    /// logged with their id (so they can be deleted server-side) and skipped.
+    pub async fn load_mail_sets_tolerant(
+        &self,
+        mailbox: &MailBox,
+    ) -> Result<Vec<MailSet>, ApiCallError> {
+        // Same list + limit `load_folders_for_mailbox` uses.
+        let items = self
+            .logged_in
             .mail_facade()
-            .load_folders_for_mailbox(mailbox)
-            .await
+            .get_crypto_entity_client()
+            .load_range_tolerant::<MailSet, GeneratedId>(
+                &mailbox.mailSets.mailSets,
+                &GeneratedId::min_id(),
+                100,
+                ListLoadDirection::ASC,
+            )
+            .await?;
+        let mut sets = Vec::with_capacity(items.len());
+        for item in items {
+            match item.result {
+                Ok(set) => sets.push(set),
+                Err(e) => log::warn!(
+                    "Skipping undecryptable MailSet {:?} — delete it in the Tuta app to clean up: {e}",
+                    item.id.map(|id| (id.list_id.to_string(), id.element_id.to_string())),
+                ),
+            }
+        }
+        Ok(sets)
     }
 
     pub fn user_id(&self) -> Option<String> {
@@ -837,10 +881,11 @@ impl MailBackend for TutaSession {
 
     async fn list_folders(&self) -> Result<Vec<FolderInfo>, String> {
         let mailbox = self.load_mailbox().await.map_err(|e| format!("{e}"))?;
-        let folder_system = self
-            .load_folders(&mailbox)
-            .await
-            .map_err(|e| format!("{e}"))?;
+        let folder_system = FolderSystem::new(
+            self.load_mail_sets_tolerant(&mailbox)
+                .await
+                .map_err(|e| format!("{e}"))?,
+        );
 
         let mut result = Vec::new();
         for indented in folder_system.indented_list() {
@@ -893,18 +938,9 @@ impl MailBackend for TutaSession {
         let mailbox = self.load_mailbox().await.map_err(|e| format!("{e}"))?;
         // Labels live in the same `mailSets` list as folders, but the SDK's
         // `FolderSystem` silently drops every `MailSet` that is neither a
-        // visible system folder nor `Custom` — so we load the raw range
-        // ourselves (same list, same limit as `load_folders_for_mailbox`).
-        let sets: Vec<MailSet> = self
-            .logged_in
-            .mail_facade()
-            .get_crypto_entity_client()
-            .load_range(
-                &mailbox.mailSets.mailSets,
-                &GeneratedId::min_id(),
-                100,
-                ListLoadDirection::ASC,
-            )
+        // visible system folder nor `Custom` — so we walk the raw list.
+        let sets = self
+            .load_mail_sets_tolerant(&mailbox)
             .await
             .map_err(|e| format!("{e}"))?;
 
@@ -934,6 +970,82 @@ impl MailBackend for TutaSession {
             .set_unread_status_for_mails(mail_ids, unread)
             .await
             .map_err(|e| format!("{e}"))
+    }
+
+    async fn create_label(&self, name: &str, color: &str) -> Result<Vec<LabelInfo>, String> {
+        // Same envelope the draft path builds and TS `MailFacade.createLabel`
+        // uses: a fresh session key for the new entity, encrypted with the
+        // mail owner-group key at its current version. The executor encrypts
+        // the `data` aggregate's fields (name, color) with the session key.
+        let randomizer = RandomizerFacade::from_core(rand_core::OsRng);
+        let session_key: GenericAesKey = Aes256Key::generate(&randomizer).into();
+
+        let mail_group_id = self
+            .logged_in
+            .mail_facade()
+            .get_group_id_for_mail_address(&self.email)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        let group_key = self
+            .logged_in
+            .get_current_sym_group_key(&mail_group_id)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        let owner_enc_session_key = group_key
+            .object
+            .encrypt_key(&session_key, Iv::generate(&randomizer));
+
+        self.logged_in
+            .get_service_executor()
+            .post::<ManageLabelService>(
+                ManageLabelServicePostIn {
+                    _format: 0,
+                    ownerEncSessionKey: owner_enc_session_key,
+                    ownerKeyVersion: group_key.version as i64,
+                    ownerGroup: mail_group_id,
+                    data: ManageLabelServiceLabelData {
+                        _id: None,
+                        name: name.to_string(),
+                        color: color.to_string(),
+                        _errors: Default::default(),
+                    },
+                    _errors: Default::default(),
+                },
+                ExtraServiceParams {
+                    session_key: Some(session_key),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| format!("{e}"))?;
+
+        self.list_labels().await
+    }
+
+    async fn apply_labels(
+        &self,
+        mail_ids: Vec<IdTupleGenerated>,
+        added: Vec<IdTupleGenerated>,
+        removed: Vec<IdTupleGenerated>,
+    ) -> Result<(), String> {
+        let executor = self.logged_in.get_service_executor();
+        // Same 50-mail server cap the SDK honors for its other mail-batch
+        // services (`MAX_MAIL_UPDATE_LIMIT`) — larger requests 400.
+        for chunk in mail_ids.chunks(50) {
+            executor
+                .post::<ApplyLabelService>(
+                    ApplyLabelServicePostIn {
+                        _format: 0,
+                        mails: chunk.to_vec(),
+                        addedLabels: added.clone(),
+                        removedLabels: removed.clone(),
+                    },
+                    ExtraServiceParams::default(),
+                )
+                .await
+                .map_err(|e| format!("{e}"))?;
+        }
+        Ok(())
     }
 
     async fn trash_mails(&self, mail_ids: Vec<IdTupleGenerated>) -> Result<(), String> {

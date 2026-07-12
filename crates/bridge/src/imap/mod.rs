@@ -247,6 +247,21 @@ mod tests {
         async fn list_labels(&self) -> Result<Vec<crate::labels::LabelInfo>, String> {
             unimplemented!()
         }
+        async fn create_label(
+            &self,
+            _name: &str,
+            _color: &str,
+        ) -> Result<Vec<crate::labels::LabelInfo>, String> {
+            unimplemented!()
+        }
+        async fn apply_labels(
+            &self,
+            _mail_ids: Vec<IdTupleGenerated>,
+            _added: Vec<IdTupleGenerated>,
+            _removed: Vec<IdTupleGenerated>,
+        ) -> Result<(), String> {
+            unimplemented!()
+        }
         async fn set_unread_status(
             &self,
             _ids: Vec<IdTupleGenerated>,

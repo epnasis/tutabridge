@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tutasdk::entities::generated::tutanota::{Mail, MailAddress, MailDetails, TutanotaFile};
 
 use crate::imap::search::{self, MsgView};
-use crate::labels::LabelRegistry;
+use crate::labels::{LabelInfo, LabelRegistry};
 use crate::mail::mail_to_rfc2822;
 use crate::mail::rfc2822::{extract_headers, format_address, format_internal_date};
 use crate::store::LocalStore;
@@ -344,10 +344,7 @@ impl ImapSession {
                     format!("* {} EXISTS\r\n", count),
                     "* 0 RECENT\r\n".to_string(),
                     flags_advertisement(&labels),
-                    // Keywords stay out of PERMANENTFLAGS for now — they are
-                    // read-only until the STORE write path lands, and this
-                    // tells well-behaved clients not to try setting them.
-                    "* OK [PERMANENTFLAGS (\\Seen \\Flagged)] Limited\r\n".to_string(),
+                    permanent_flags_advertisement(&labels),
                     "* OK [UIDVALIDITY 1] UIDs valid\r\n".to_string(),
                     format!("* OK [UIDNEXT {}] Predicted next UID\r\n", self.uid_next),
                 ];
@@ -626,43 +623,221 @@ impl ImapSession {
         if self.state != State::Selected {
             return vec![format!("{} NO No mailbox selected\r\n", tag)];
         }
+        let cmd = if uid_mode { "UID STORE" } else { "STORE" };
 
-        let args_upper = args.to_uppercase();
-        let (seq_set, _) = parse_store_args(args);
-        let indices = self.resolve_sequence_set(&seq_set, uid_mode);
-        let adding = args_upper.contains("+FLAGS");
-        let removing = args_upper.contains("-FLAGS");
+        let Some(store_args) = parse_store_args(args) else {
+            return vec![format!("{} BAD Invalid STORE arguments\r\n", tag)];
+        };
+        let indices = self.resolve_sequence_set(&store_args.seq_set, uid_mode);
+        let mut labels = self.store.label_registry().await;
 
-        if args_upper.contains("\\SEEN") {
-            for idx in &indices {
-                if *idx < self.mails.len() {
-                    self.mails[*idx].mail.unread = !adding;
+        // Bucket the flag list: the system flags Tuta can express, keywords
+        // that map to labels, and unknown keywords. \Answered / \Flagged /
+        // \Draft have no Tuta backing — accepted and dropped, as before.
+        let mut wants_seen = false;
+        let mut wants_deleted = false;
+        let mut requested: Vec<LabelInfo> = Vec::new();
+        let mut unknown: Vec<String> = Vec::new();
+        for flag in &store_args.flags {
+            if flag.eq_ignore_ascii_case("\\Seen") {
+                wants_seen = true;
+            } else if flag.eq_ignore_ascii_case("\\Deleted") {
+                wants_deleted = true;
+            } else if flag.starts_with('\\') {
+                // System flag without Tuta backing.
+            } else if let Some(info) = labels.label_for_keyword(flag) {
+                requested.push(info.clone());
+            } else {
+                unknown.push(flag.clone());
+            }
+        }
+
+        // Unknown keywords create labels (we advertise `\*`) — but only when
+        // the STORE would add them; removing a keyword no label backs is a
+        // no-op. Only keywords the sanitizer maps back onto themselves are
+        // eligible: for any other name the created label's atom would differ
+        // from what the client stored, leaving a keyword that never matches.
+        if store_args.op != StoreOp::Remove && !unknown.is_empty() {
+            let mut created = false;
+            for kw in &unknown {
+                if crate::labels::sanitize_keyword(kw) != *kw {
+                    log::warn!(
+                        "STORE: not creating a label for keyword {kw:?} — \
+                         its atom would not round-trip"
+                    );
+                    continue;
+                }
+                match self
+                    .backend
+                    .create_label(kw, crate::labels::DEFAULT_LABEL_COLOR)
+                    .await
+                {
+                    Ok(fresh) => {
+                        log::info!("STORE: created Tuta label {kw:?} for new keyword");
+                        self.store.set_labels(fresh).await;
+                        created = true;
+                    }
+                    Err(e) => log::warn!("STORE: creating label {kw:?} failed: {e}"),
                 }
             }
+            if created {
+                // Re-resolve against the refreshed registry so the new
+                // labels join this STORE's apply pass.
+                labels = self.store.label_registry().await;
+                for kw in &unknown {
+                    if let Some(info) = labels.label_for_keyword(kw) {
+                        requested.push(info.clone());
+                    }
+                }
+            }
+        } else if !unknown.is_empty() {
+            log::warn!("STORE: ignoring unknown keyword(s) {unknown:?} in -FLAGS");
+        }
 
+        // \Seen. Replace mode (bare FLAGS) derives the state from the
+        // flag's presence in the list, per RFC 3501 §6.4.6.
+        if wants_seen || store_args.op == StoreOp::Replace {
+            let unread = match store_args.op {
+                StoreOp::Add => false,
+                StoreOp::Remove => true,
+                StoreOp::Replace => !wants_seen,
+            };
+            for &idx in &indices {
+                if let Some(m) = self.mails.get_mut(idx) {
+                    m.mail.unread = unread;
+                }
+            }
             let mail_ids: Vec<_> = indices
                 .iter()
                 .filter_map(|&i| self.mails.get(i))
                 .filter_map(|m| m.mail._id.clone())
                 .collect();
-
             if !mail_ids.is_empty() {
-                if let Err(e) = self.backend.set_unread_status(mail_ids, !adding).await {
+                if let Err(e) = self.backend.set_unread_status(mail_ids, unread).await {
                     log::warn!("Failed to update read status on server: {}", e);
                 }
             }
         }
 
-        if args_upper.contains("\\DELETED") {
-            for idx in &indices {
-                if *idx < self.mails.len() {
-                    self.mails[*idx].deleted = if removing { false } else { true };
+        // \Deleted — session-local until EXPUNGE, as before.
+        if wants_deleted || store_args.op == StoreOp::Replace {
+            let deleted = match store_args.op {
+                StoreOp::Add => true,
+                StoreOp::Remove => false,
+                StoreOp::Replace => wants_deleted,
+            };
+            for &idx in &indices {
+                if let Some(m) = self.mails.get_mut(idx) {
+                    m.deleted = deleted;
                 }
             }
         }
 
-        let cmd = if uid_mode { "UID STORE" } else { "STORE" };
-        vec![format!("{} OK {} completed\r\n", tag, cmd)]
+        // Label keywords → ApplyLabelService.
+        match store_args.op {
+            StoreOp::Add | StoreOp::Remove => {
+                if !requested.is_empty() {
+                    let tuples: Vec<_> = requested.iter().map(|l| l.id_tuple()).collect();
+                    let (added, removed) = if store_args.op == StoreOp::Add {
+                        (tuples, Vec::new())
+                    } else {
+                        (Vec::new(), tuples)
+                    };
+                    let mail_ids: Vec<_> = indices
+                        .iter()
+                        .filter_map(|&i| self.mails.get(i))
+                        .filter_map(|m| m.mail._id.clone())
+                        .collect();
+                    if !mail_ids.is_empty() {
+                        self.apply_labels_optimistically(&indices, mail_ids, added, removed)
+                            .await;
+                    }
+                }
+            }
+            StoreOp::Replace => {
+                // Replace-mode diffs start from each mail's own label set,
+                // so this is one service call per mail — acceptable for a
+                // client path that mainstream clients don't use for tags.
+                for &idx in &indices {
+                    let Some(m) = self.mails.get(idx) else {
+                        continue;
+                    };
+                    let Some(id) = m.mail._id.clone() else {
+                        continue;
+                    };
+                    let current: Vec<_> = m
+                        .mail
+                        .sets
+                        .iter()
+                        .filter(|s| labels.keyword_for_label(s.element_id.0.as_str()).is_some())
+                        .cloned()
+                        .collect();
+                    let added: Vec<_> = requested
+                        .iter()
+                        .filter(|l| !current.iter().any(|c| c.element_id.0 == l.id))
+                        .map(|l| l.id_tuple())
+                        .collect();
+                    let removed: Vec<_> = current
+                        .into_iter()
+                        .filter(|c| !requested.iter().any(|l| l.id == c.element_id.0))
+                        .collect();
+                    if added.is_empty() && removed.is_empty() {
+                        continue;
+                    }
+                    self.apply_labels_optimistically(&[idx], vec![id], added, removed)
+                        .await;
+                }
+            }
+        }
+
+        // RFC 3501 §6.4.6: answer with the new flags as untagged FETCH
+        // responses unless the client asked for .SILENT.
+        let mut responses = Vec::new();
+        if !store_args.silent {
+            for &idx in &indices {
+                if let Some(m) = self.mails.get(idx) {
+                    responses.push(build_fetch_response(
+                        idx + 1,
+                        m,
+                        "(FLAGS)",
+                        uid_mode,
+                        &labels,
+                    ));
+                }
+            }
+        }
+        responses.push(format!("{} OK {} completed\r\n", tag, cmd));
+        responses
+    }
+
+    /// Send one label diff to the server and, on success, mirror it into the
+    /// session view and the shared store — FETCHes reflect the change
+    /// immediately, the event bus delivers the authoritative state later.
+    async fn apply_labels_optimistically(
+        &mut self,
+        indices: &[usize],
+        mail_ids: Vec<tutasdk::IdTupleGenerated>,
+        added: Vec<tutasdk::IdTupleGenerated>,
+        removed: Vec<tutasdk::IdTupleGenerated>,
+    ) {
+        if let Err(e) = self
+            .backend
+            .apply_labels(mail_ids, added.clone(), removed.clone())
+            .await
+        {
+            log::warn!("Failed to apply labels on server: {e}");
+            return;
+        }
+        let mut refreshed = Vec::with_capacity(indices.len());
+        for &idx in indices {
+            if let Some(m) = self.mails.get_mut(idx) {
+                apply_label_sets(&mut m.mail.sets, &added, &removed);
+                refreshed.push(m.mail.clone());
+            }
+        }
+        for mail in &refreshed {
+            self.store.refresh_mail_in_place(mail).await;
+        }
     }
 
     async fn cmd_uid(&mut self, tag: &str, args: &str) -> Vec<String> {
@@ -918,6 +1093,16 @@ fn flags_advertisement(labels: &LabelRegistry) -> String {
     format!("* FLAGS ({})\r\n", flags.join(" "))
 }
 
+/// PERMANENTFLAGS: what a client may STORE persistently. Label keywords are
+/// writable (STORE routes them to `ApplyLabelService`), and `\*` tells
+/// clients they may invent new keywords — STORE creates the backing label.
+fn permanent_flags_advertisement(labels: &LabelRegistry) -> String {
+    let mut flags = vec!["\\Seen", "\\Flagged"];
+    flags.extend(labels.keywords());
+    flags.push("\\*");
+    format!("* OK [PERMANENTFLAGS ({})] Limited\r\n", flags.join(" "))
+}
+
 fn build_fetch_response(
     seq: usize,
     cached: &CachedMail,
@@ -1145,11 +1330,65 @@ fn parse_fetch_args(args: &str) -> (String, String) {
     }
 }
 
-fn parse_store_args(args: &str) -> (String, String) {
-    let parts: Vec<&str> = args.splitn(2, ' ').collect();
-    let seq = parts.first().unwrap_or(&"").to_string();
-    let rest = parts.get(1).unwrap_or(&"").to_string();
-    (seq, rest)
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StoreOp {
+    Add,
+    Remove,
+    Replace,
+}
+
+#[derive(Debug)]
+struct StoreArgs {
+    seq_set: String,
+    op: StoreOp,
+    silent: bool,
+    flags: Vec<String>,
+}
+
+/// Parse STORE arguments: `<sequence set> <±FLAGS[.SILENT]> (flag ...)`.
+/// The parentheses around the flag list are optional per RFC 3501. `None`
+/// when the data item is not a FLAGS variant.
+fn parse_store_args(args: &str) -> Option<StoreArgs> {
+    let mut parts = args.trim().splitn(3, char::is_whitespace);
+    let seq_set = parts.next()?.to_string();
+    let (op, silent) = match parts.next()?.to_uppercase().as_str() {
+        "FLAGS" => (StoreOp::Replace, false),
+        "FLAGS.SILENT" => (StoreOp::Replace, true),
+        "+FLAGS" => (StoreOp::Add, false),
+        "+FLAGS.SILENT" => (StoreOp::Add, true),
+        "-FLAGS" => (StoreOp::Remove, false),
+        "-FLAGS.SILENT" => (StoreOp::Remove, true),
+        _ => return None,
+    };
+    let flags = parts
+        .next()
+        .unwrap_or("")
+        .split(|c: char| c.is_whitespace() || c == '(' || c == ')')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    Some(StoreArgs {
+        seq_set,
+        op,
+        silent,
+        flags,
+    })
+}
+
+/// Optimistically apply a label diff to a mail's `sets` list. Idempotent —
+/// re-applying the same diff leaves the list unchanged; the event bus
+/// delivers the authoritative version later.
+fn apply_label_sets(
+    sets: &mut Vec<tutasdk::IdTupleGenerated>,
+    added: &[tutasdk::IdTupleGenerated],
+    removed: &[tutasdk::IdTupleGenerated],
+) {
+    sets.retain(|s| !removed.iter().any(|r| r.element_id.0 == s.element_id.0));
+    for a in added {
+        if !sets.iter().any(|s| s.element_id.0 == a.element_id.0) {
+            sets.push(a.clone());
+        }
+    }
 }
 
 /// Whether a FETCH item list requires the real message body to be loaded.
@@ -1452,9 +1691,11 @@ mod tests {
 
     #[test]
     fn test_parse_store_args() {
-        let (seq, rest) = parse_store_args("1:3 +FLAGS (\\Seen)");
-        assert_eq!(seq, "1:3");
-        assert_eq!(rest, "+FLAGS (\\Seen)");
+        let a = parse_store_args("1:3 +FLAGS (\\Seen)").unwrap();
+        assert_eq!(a.seq_set, "1:3");
+        assert_eq!(a.op, StoreOp::Add);
+        assert!(!a.silent);
+        assert_eq!(a.flags, vec!["\\Seen"]);
     }
 
     // --- parse_seq_num ---
@@ -1832,6 +2073,17 @@ mod tests {
         unread_calls: Mutex<Vec<(Vec<IdTupleGenerated>, bool)>>,
         sent: Mutex<Vec<ParsedMessage>>,
         moved: Mutex<Vec<(Vec<IdTupleGenerated>, String)>>,
+        /// Recorded `apply_labels` calls: (mails, added, removed).
+        #[allow(clippy::type_complexity)]
+        labels_applied: Mutex<
+            Vec<(
+                Vec<IdTupleGenerated>,
+                Vec<IdTupleGenerated>,
+                Vec<IdTupleGenerated>,
+            )>,
+        >,
+        /// Backend-side label list; `create_label` appends here.
+        labels: Mutex<Vec<crate::labels::LabelInfo>>,
         fail_details: Mutex<bool>,
     }
 
@@ -1844,6 +2096,8 @@ mod tests {
                 unread_calls: Mutex::new(Vec::new()),
                 sent: Mutex::new(Vec::new()),
                 moved: Mutex::new(Vec::new()),
+                labels_applied: Mutex::new(Vec::new()),
+                labels: Mutex::new(Vec::new()),
                 fail_details: Mutex::new(false),
             }
         }
@@ -2040,7 +2294,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn select_advertises_label_keywords_but_not_permanent() {
+    async fn select_advertises_label_keywords_as_permanent_without_star() {
         let backend = Arc::new(MockBackend::with_mails(vec![make_mail("e1", "s", true)]));
         let (store, mut session) = make_session(backend).await;
         store
@@ -2060,15 +2314,295 @@ mod tests {
             flags.contains("\\Draft Package_Tracking Wazne"),
             "keywords must follow the system flags: {flags}"
         );
-        // Read-only phase: clients must not be told they can STORE keywords.
+        // Keywords are STOREable, and `\*` invites clients to invent new
+        // ones — STORE creates the backing label.
         let perm = resp
             .iter()
             .find(|r| r.contains("PERMANENTFLAGS"))
             .expect("SELECT must advertise PERMANENTFLAGS");
         assert!(
-            !perm.contains("Package_Tracking") && !perm.contains("\\*"),
-            "keywords must stay out of PERMANENTFLAGS: {perm}"
+            perm.contains("Package_Tracking") && perm.contains("Wazne"),
+            "keywords must be permanent: {perm}"
         );
+        assert!(perm.contains("\\*"), "\\* must be advertised: {perm}");
+    }
+
+    #[tokio::test]
+    async fn store_plus_keyword_applies_label_and_reports_flags() {
+        let mail = make_mail("e1", "s", false);
+        let backend = Arc::new(MockBackend::with_mails(vec![mail]));
+        let (store, mut session) = make_session(backend.clone()).await;
+        store.set_labels(vec![test_label("l1", "Ephemeral")]).await;
+        session.handle_command("a LOGIN u p").await;
+        session.handle_command("b SELECT INBOX").await;
+
+        // Lowercase keyword — Thunderbird sends its lowercased tag key.
+        let resp = session
+            .handle_command("c UID STORE 1 +FLAGS (ephemeral)")
+            .await;
+
+        let calls = backend.labels_applied.lock().unwrap();
+        assert_eq!(calls.len(), 1, "one batched ApplyLabelService call");
+        let (mails, added, removed) = &calls[0];
+        assert_eq!(mails.len(), 1);
+        assert_eq!(mails[0].element_id.to_string(), "e1");
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].element_id.to_string(), "l1");
+        assert!(removed.is_empty());
+        drop(calls);
+
+        // Untagged FETCH with the new flags (and UID — UID mode).
+        assert!(
+            resp[0].contains("FETCH (UID 1 FLAGS (\\Seen Ephemeral))"),
+            "untagged FETCH must report the new flags: {:?}",
+            resp[0]
+        );
+        assert!(resp.last().unwrap().contains("OK UID STORE"));
+
+        // Optimistic update reached the shared store too.
+        let stored = store.get_folder("inbox").await;
+        assert!(stored[0]
+            .mail
+            .sets
+            .iter()
+            .any(|s| s.element_id.to_string() == "l1"));
+    }
+
+    #[tokio::test]
+    async fn store_minus_keyword_removes_label() {
+        let mut mail = make_mail("e1", "s", false);
+        mail.sets = vec![IdTupleGenerated::new(test_id("labels"), test_id("l1"))];
+        let backend = Arc::new(MockBackend::with_mails(vec![mail]));
+        let (store, mut session) = make_session(backend.clone()).await;
+        store.set_labels(vec![test_label("l1", "Ephemeral")]).await;
+        session.handle_command("a LOGIN u p").await;
+        session.handle_command("b SELECT INBOX").await;
+
+        let resp = session.handle_command("c STORE 1 -FLAGS (Ephemeral)").await;
+
+        let calls = backend.labels_applied.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let (_, added, removed) = &calls[0];
+        assert!(added.is_empty());
+        assert_eq!(removed[0].element_id.to_string(), "l1");
+        drop(calls);
+
+        assert!(
+            resp[0].contains("FLAGS (\\Seen)") && !resp[0].contains("Ephemeral"),
+            "keyword must be gone from the reported flags: {:?}",
+            resp[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn store_silent_suppresses_untagged_fetch() {
+        let backend = Arc::new(MockBackend::with_mails(vec![make_mail("e1", "s", false)]));
+        let (store, mut session) = make_session(backend.clone()).await;
+        store.set_labels(vec![test_label("l1", "Ephemeral")]).await;
+        session.handle_command("a LOGIN u p").await;
+        session.handle_command("b SELECT INBOX").await;
+
+        let resp = session
+            .handle_command("c STORE 1 +FLAGS.SILENT (Ephemeral)")
+            .await;
+        assert_eq!(
+            resp.len(),
+            1,
+            ".SILENT must suppress untagged FETCH: {resp:?}"
+        );
+        assert!(resp[0].contains("OK STORE"));
+        // The label call still happened.
+        assert_eq!(backend.labels_applied.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn store_mixed_system_flag_and_keyword() {
+        let backend = Arc::new(MockBackend::with_mails(vec![make_mail("e1", "s", true)]));
+        let (store, mut session) = make_session(backend.clone()).await;
+        store.set_labels(vec![test_label("l1", "Ephemeral")]).await;
+        session.handle_command("a LOGIN u p").await;
+        session.handle_command("b SELECT INBOX").await;
+
+        let resp = session
+            .handle_command("c STORE 1 +FLAGS (\\Seen Ephemeral)")
+            .await;
+
+        // Both backends hit: read status and label service.
+        let unread = backend.unread_calls.lock().unwrap();
+        assert_eq!(unread.len(), 1);
+        assert!(!unread[0].1, "+FLAGS \\Seen marks read");
+        drop(unread);
+        assert_eq!(backend.labels_applied.lock().unwrap().len(), 1);
+
+        assert!(
+            resp[0].contains("FLAGS (\\Seen Ephemeral)"),
+            "both flags reported: {:?}",
+            resp[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn store_unknown_keyword_creates_label_and_applies_it() {
+        let backend = Arc::new(MockBackend::with_mails(vec![make_mail("e1", "s", false)]));
+        let (store, mut session) = make_session(backend.clone()).await;
+        session.handle_command("a LOGIN u p").await;
+        session.handle_command("b SELECT INBOX").await;
+
+        let resp = session.handle_command("c STORE 1 +FLAGS (ProjectX)").await;
+
+        // The label was created backend-side with the bridge default color…
+        {
+            let created = backend.labels.lock().unwrap();
+            assert_eq!(created.len(), 1);
+            assert_eq!(created[0].name, "ProjectX");
+            assert_eq!(created[0].color.as_deref(), Some(""));
+        }
+        // …applied to the mail in the same STORE…
+        {
+            let calls = backend.labels_applied.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].1[0].element_id.to_string(), "created_1");
+        }
+        // …reported in the untagged FETCH, and registered for future STOREs.
+        assert!(
+            resp[0].contains("FLAGS (\\Seen ProjectX)"),
+            "new keyword must be reported: {:?}",
+            resp[0]
+        );
+        let reg = store.label_registry().await;
+        assert_eq!(reg.label_for_keyword("projectx").unwrap().id, "created_1");
+    }
+
+    #[tokio::test]
+    async fn store_minus_unknown_keyword_does_not_create() {
+        let backend = Arc::new(MockBackend::with_mails(vec![make_mail("e1", "s", false)]));
+        let (_store, mut session) = make_session(backend.clone()).await;
+        session.handle_command("a LOGIN u p").await;
+        session.handle_command("b SELECT INBOX").await;
+
+        let resp = session.handle_command("c STORE 1 -FLAGS (Nope)").await;
+        assert!(resp.last().unwrap().contains("OK STORE"));
+        // Removing a keyword no label backs is a no-op, not a create.
+        assert!(backend.labels.lock().unwrap().is_empty());
+        assert!(backend.labels_applied.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn store_non_roundtripping_keyword_skipped_but_rest_applies() {
+        let backend = Arc::new(MockBackend::with_mails(vec![make_mail("e1", "s", true)]));
+        let (_store, mut session) = make_session(backend.clone()).await;
+        session.handle_command("a LOGIN u p").await;
+        session.handle_command("b SELECT INBOX").await;
+
+        // '&' sanitizes to '_', so the created label's atom would not match
+        // the stored keyword — the bridge must skip it, not create garbage.
+        let resp = session
+            .handle_command("c STORE 1 +FLAGS (\\Seen No&Such)")
+            .await;
+
+        assert!(resp.last().unwrap().contains("OK STORE"));
+        assert_eq!(backend.unread_calls.lock().unwrap().len(), 1);
+        assert!(backend.labels.lock().unwrap().is_empty());
+        assert!(backend.labels_applied.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn label_rename_and_delete_refresh_keywords() {
+        let mut mail = make_mail("e1", "s", false);
+        mail.sets = vec![IdTupleGenerated::new(test_id("labels"), test_id("l1"))];
+        let backend = Arc::new(MockBackend::with_mails(vec![mail]));
+        let (store, mut session) = make_session(backend).await;
+        store.set_labels(vec![test_label("l1", "OldName")]).await;
+        session.handle_command("a LOGIN u p").await;
+        session.handle_command("b SELECT INBOX").await;
+
+        let resp = session.handle_command("c FETCH 1 (FLAGS)").await;
+        assert!(resp[0].contains("OldName"));
+
+        // Rename in the Tuta app arrives as a MailSet event → registry
+        // rebuild. Same label id, new atom.
+        store.set_labels(vec![test_label("l1", "NewName")]).await;
+        let resp = session.handle_command("d FETCH 1 (FLAGS)").await;
+        assert!(
+            resp[0].contains("NewName") && !resp[0].contains("OldName"),
+            "renamed label must swap atoms: {:?}",
+            resp[0]
+        );
+
+        // Delete: the keyword vanishes even though the mail's `sets` still
+        // carries the stale id until the Mail update event lands.
+        store.set_labels(Vec::new()).await;
+        let resp = session.handle_command("e FETCH 1 (FLAGS)").await;
+        assert!(
+            !resp[0].contains("NewName"),
+            "deleted label must disappear from FLAGS: {:?}",
+            resp[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn store_replace_mode_diffs_labels_per_mail() {
+        let mut mail = make_mail("e1", "s", false);
+        mail.sets = vec![
+            // Folder membership must survive a label replace untouched.
+            IdTupleGenerated::new(test_id("folders"), test_id("inbox")),
+            IdTupleGenerated::new(test_id("labels"), test_id("l1")),
+        ];
+        let backend = Arc::new(MockBackend::with_mails(vec![mail]));
+        let (store, mut session) = make_session(backend.clone()).await;
+        store
+            .set_labels(vec![
+                test_label("l1", "Ephemeral"),
+                test_label("l2", "Keep"),
+            ])
+            .await;
+        session.handle_command("a LOGIN u p").await;
+        session.handle_command("b SELECT INBOX").await;
+
+        let resp = session
+            .handle_command("c STORE 1 FLAGS (\\Seen Keep)")
+            .await;
+
+        let calls = backend.labels_applied.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let (_, added, removed) = &calls[0];
+        assert_eq!(added[0].element_id.to_string(), "l2");
+        assert_eq!(removed[0].element_id.to_string(), "l1");
+        drop(calls);
+
+        assert!(
+            resp[0].contains("FLAGS (\\Seen Keep)"),
+            "replaced flag set reported: {:?}",
+            resp[0]
+        );
+        // Folder membership untouched by the optimistic sets update.
+        let folder_still_there = session.mails[0]
+            .mail
+            .sets
+            .iter()
+            .any(|s| s.element_id.to_string() == "inbox");
+        assert!(folder_still_there);
+    }
+
+    #[test]
+    fn parse_store_args_variants() {
+        let a = parse_store_args("1:5 +FLAGS.SILENT (\\Seen temp)").unwrap();
+        assert_eq!(a.seq_set, "1:5");
+        assert_eq!(a.op, StoreOp::Add);
+        assert!(a.silent);
+        assert_eq!(a.flags, vec!["\\Seen", "temp"]);
+
+        let b = parse_store_args("7 -flags fup").unwrap();
+        assert_eq!(b.op, StoreOp::Remove);
+        assert!(!b.silent);
+        assert_eq!(b.flags, vec!["fup"]);
+
+        let c = parse_store_args("2 FLAGS ()").unwrap();
+        assert_eq!(c.op, StoreOp::Replace);
+        assert!(c.flags.is_empty());
+
+        assert!(parse_store_args("2 NOTFLAGS (x)").is_none());
+        assert!(parse_store_args("").is_none());
     }
 
     #[tokio::test]
@@ -2234,7 +2768,22 @@ mod tests {
         async fn list_labels(&self) -> Result<Vec<crate::labels::LabelInfo>, String> {
             // Sessions read labels from the MailStore registry, never from
             // the backend — tests seed the store directly via `set_labels`.
-            Ok(Vec::new())
+            Ok(self.labels.lock().unwrap().clone())
+        }
+        async fn create_label(
+            &self,
+            name: &str,
+            color: &str,
+        ) -> Result<Vec<crate::labels::LabelInfo>, String> {
+            let mut labels = self.labels.lock().unwrap();
+            let id = format!("created_{}", labels.len() + 1);
+            labels.push(crate::labels::LabelInfo {
+                id,
+                list_id: "labels".to_string(),
+                name: name.to_string(),
+                color: Some(color.to_string()),
+            });
+            Ok(labels.clone())
         }
         async fn set_unread_status(
             &self,
@@ -2242,6 +2791,18 @@ mod tests {
             unread: bool,
         ) -> Result<(), String> {
             self.unread_calls.lock().unwrap().push((mail_ids, unread));
+            Ok(())
+        }
+        async fn apply_labels(
+            &self,
+            mail_ids: Vec<IdTupleGenerated>,
+            added: Vec<IdTupleGenerated>,
+            removed: Vec<IdTupleGenerated>,
+        ) -> Result<(), String> {
+            self.labels_applied
+                .lock()
+                .unwrap()
+                .push((mail_ids, added, removed));
             Ok(())
         }
         async fn trash_mails(&self, mail_ids: Vec<IdTupleGenerated>) -> Result<(), String> {
@@ -2429,9 +2990,11 @@ mod tests {
         session.handle_command("A001 LOGIN user pass").await;
         session.handle_command("A002 SELECT INBOX").await;
 
-        // Mark as read
+        // Mark as read — the new state comes back as an untagged FETCH
+        // (RFC 3501 §6.4.6) followed by the tagged OK.
         let resp = session.handle_command("A003 STORE 1 +FLAGS (\\Seen)").await;
-        assert!(resp[0].contains("OK"));
+        assert!(resp[0].contains("* 1 FETCH (FLAGS (\\Seen))"), "{resp:?}");
+        assert!(resp.last().unwrap().contains("OK"));
 
         // Verify backend was called
         let calls = backend.unread_calls.lock().unwrap();
