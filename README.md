@@ -56,6 +56,7 @@ encryption transparently, so your favourite desktop client just works.
 | **Honest search** | Subject, sender and date search the entire mailbox; full-text body search via an encrypted on-disk index. |
 | **Attachments** | Both ways. Incoming served as `multipart/mixed`, outgoing uploaded to Tuta on send. |
 | **Folders & flags** | Drafts, custom and nested folders, move, trash, read/unread. |
+| **Labels ↔ tags** | Tuta labels sync two-way as IMAP keywords: Thunderbird tags show them, tagging round-trips to the Tuta apps, and creating a brand-new tag creates the label. |
 | **Encrypted cache** | Metadata in SQLCipher, bodies as individually encrypted files. Usable instantly on relaunch, only the delta is fetched. |
 | **Complete backup** | Export every message to portable `.eml` files. |
 | **2FA (TOTP)** | Two-factor login supported. |
