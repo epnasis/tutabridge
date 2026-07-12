@@ -396,6 +396,9 @@ mod tests {
         async fn list_folders(&self) -> Result<Vec<FolderInfo>, String> {
             Ok(self.folders.clone())
         }
+        async fn list_labels(&self) -> Result<Vec<crate::labels::LabelInfo>, String> {
+            Ok(Vec::new())
+        }
         async fn load_mail_ids_for_folder(
             &self,
             folder: &FolderInfo,

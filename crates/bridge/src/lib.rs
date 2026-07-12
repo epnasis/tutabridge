@@ -4,6 +4,7 @@ pub mod config;
 pub mod event_handler;
 mod governed_client;
 pub mod imap;
+pub mod labels;
 pub mod mail;
 pub mod mcp;
 mod net;

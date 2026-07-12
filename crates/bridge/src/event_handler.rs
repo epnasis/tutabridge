@@ -276,6 +276,14 @@ async fn refresh_folder_list(
         }
         Err(e) => warn!("MailSet event: folder list refresh failed: {e}"),
     }
+
+    // Labels are MailSets too, so a label create/rename/delete lands in the
+    // same `folder_list_dirty` bucket — refresh the keyword registry with
+    // the folder list.
+    match backend.list_labels().await {
+        Ok(labels) => store.set_labels(labels).await,
+        Err(e) => warn!("MailSet event: label list refresh failed: {e}"),
+    }
 }
 
 async fn apply_mail_set_entry_create(
