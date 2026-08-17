@@ -15,6 +15,24 @@ Tuta API  ←──  Syncer (background)  ──→  MailStore (in-memory)  ←�
 - The **IMAP server** (`imap/`) ONLY reads from the `MailStore`. It NEVER makes API calls for reads.
 - The only IMAP→network calls are **mutations**: marking read/unread (`STORE \Seen`), trashing (`EXPUNGE`), moving (`MOVE`), and label operations (`STORE` with keywords — apply/remove/create, see below).
 
+### Synthesized messages carry provenance headers only
+
+`mail_to_rfc2822` RECONSTRUCTS a message from the Tuta entity; it never
+forwards an original. So the header set is ours (`Date`, `From`, `Subject`,
+`To`/`Cc`, a synthesized `Message-ID`, MIME) plus an allowlist copied from
+`MailDetails.headers`: `List-Unsubscribe`, `List-Unsubscribe-Post`,
+`List-Id`, `Precedence`, `Auto-Submitted`. The allowlist is the whole design
+— the body we emit is re-encoded with our own boundary, so the sender's
+`Content-Type`, `Message-ID`, `MIME-Version`, `DKIM-Signature` and `Received`
+would all describe a body that no longer exists. Header values are
+sender-controlled, so parsing is line-wise and stray CR/LF is stripped: a
+value cannot smuggle a structural header in. Absent headers are normal
+(Tuta-internal mail never had any).
+
+**Renditions are cached** (`<element_id>.eml.enc`, gated by `has_eml`), so
+changing what this function emits only affects mail rendered after the
+change. Mail already in the cache keeps its old headers until re-rendered.
+
 ### Labels ↔ IMAP keywords
 
 Tuta labels (`MailSet`s with `kind == Label`) are exposed as IMAP keywords
