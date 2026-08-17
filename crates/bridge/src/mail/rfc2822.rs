@@ -6,6 +6,87 @@ use tutasdk::entities::generated::tutanota::{Mail, MailAddress, MailDetails, Tut
 /// decrypted bytes (for the body of the part).
 pub type AttachmentPart<'a> = (&'a TutanotaFile, &'a [u8]);
 
+/// Headers copied from the sender's original message into the one we build.
+///
+/// The message served over IMAP is a RECONSTRUCTION, not the original: the
+/// body is re-encoded, the MIME boundary is ours, the Message-ID is ours. So
+/// any header describing the message's own structure would describe a body
+/// that no longer exists — `Content-Type` would contradict the part we just
+/// wrote, a second `Message-ID` would collide with the one clients already
+/// keyed on, and `DKIM-Signature`/`Received` cannot verify against a body
+/// they never covered. What survives that rule is the narrow set of headers
+/// stating a fact about the mail's PROVENANCE, which is exactly what
+/// downstream filtering (mail-client rules, sweepy) needs and cannot infer.
+const PASSTHROUGH_HEADERS: &[&str] = &[
+    "list-unsubscribe",
+    "list-unsubscribe-post",
+    "list-id",
+    "precedence",
+    "auto-submitted",
+];
+
+/// The sender's original header block, as Tuta stored it with the mail.
+///
+/// Mirrors how the body is read: the SDK's entity facade decompresses LZ4
+/// fields during decryption, so `compressedHeaders` arrives as plain text and
+/// is preferred when present. Absent for mail that never had RFC 2822 headers
+/// (Tuta-internal mail), which is normal and not an error.
+fn original_headers(details: &MailDetails) -> Option<&str> {
+    let header = details.headers.as_ref()?;
+    header
+        .compressedHeaders
+        .as_deref()
+        .or(header.headers.as_deref())
+}
+
+/// Extract the allowlisted headers from an original header block, preserving
+/// RFC 5322 §2.2.3 folded continuation lines (List-Unsubscribe values wrap
+/// routinely).
+///
+/// Parsing line-by-line and re-emitting only whole allowlisted fields is also
+/// what makes this safe: header values are sender-controlled, so a value
+/// carrying an embedded newline plus `Content-Type: …` must not be able to
+/// smuggle a structural header into our message. Such a line is simply a
+/// non-allowlisted field name to this loop, and is dropped.
+pub(crate) fn passthrough_headers(raw: &str) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+    let mut keeping = false;
+
+    for line in raw.lines() {
+        if line.is_empty() {
+            break; // end of the header block; a body must not be re-parsed
+        }
+
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if keeping {
+                if let Some(last) = kept.last_mut() {
+                    last.push_str("\r\n");
+                    last.push_str(&sanitize_header_line(line));
+                }
+            }
+            continue;
+        }
+
+        keeping = match line.split_once(':') {
+            Some((name, _)) => {
+                PASSTHROUGH_HEADERS.contains(&name.trim().to_ascii_lowercase().as_str())
+            }
+            None => false,
+        };
+        if keeping {
+            kept.push(sanitize_header_line(line));
+        }
+    }
+
+    kept
+}
+
+/// A stray CR or LF inside a field would terminate the header block early.
+/// `str::lines` only strips a trailing CR, so anything embedded is neutralised.
+fn sanitize_header_line(line: &str) -> String {
+    line.replace(['\r', '\n'], " ")
+}
+
 pub fn mail_to_rfc2822(
     mail: &Mail,
     details: Option<&MailDetails>,
@@ -52,6 +133,13 @@ pub fn mail_to_rfc2822(
             "Message-ID: <{}.{}@tutabridge.local>\r\n",
             id.list_id, id.element_id
         ));
+    }
+
+    if let Some(raw) = details.and_then(original_headers) {
+        for header in passthrough_headers(raw) {
+            msg.push_str(&header);
+            msg.push_str("\r\n");
+        }
     }
 
     msg.push_str("MIME-Version: 1.0\r\n");
@@ -489,6 +577,65 @@ mod tests {
     }
 
     #[test]
+    fn passthrough_keeps_provenance_headers() {
+        let raw = "From: a@b.com\r\nList-Unsubscribe: <https://x.test/u?id=1>\r\n\
+                   Precedence: bulk\r\nAuto-Submitted: auto-generated\r\n";
+        assert_eq!(
+            passthrough_headers(raw),
+            vec![
+                "List-Unsubscribe: <https://x.test/u?id=1>",
+                "Precedence: bulk",
+                "Auto-Submitted: auto-generated",
+            ]
+        );
+    }
+
+    #[test]
+    fn passthrough_drops_structural_headers() {
+        let raw = "Content-Type: text/plain; boundary=\"old\"\r\n\
+                   Message-ID: <original@sender.test>\r\n\
+                   DKIM-Signature: v=1; a=rsa-sha256; b=abc\r\n\
+                   Received: from mx.test by y.test\r\n\
+                   MIME-Version: 1.0\r\n\
+                   Content-Transfer-Encoding: quoted-printable\r\n";
+        assert!(passthrough_headers(raw).is_empty());
+    }
+
+    #[test]
+    fn passthrough_preserves_folded_values() {
+        let raw = "List-Unsubscribe: <https://x.test/u?id=1>,\r\n\t<mailto:u@x.test>\r\n";
+        assert_eq!(
+            passthrough_headers(raw),
+            vec!["List-Unsubscribe: <https://x.test/u?id=1>,\r\n\t<mailto:u@x.test>"]
+        );
+    }
+
+    #[test]
+    fn passthrough_is_case_insensitive_on_field_names() {
+        let raw = "list-unsubscribe: <https://x.test/u>\r\nLIST-ID: <news.x.test>\r\n";
+        assert_eq!(passthrough_headers(raw).len(), 2);
+    }
+
+    #[test]
+    fn passthrough_cannot_smuggle_a_structural_header() {
+        // A sender-controlled value that tries to inject a header of its own:
+        // in the block that is simply a second, non-allowlisted field line.
+        let raw = "List-Id: <news.x.test>\r\nContent-Type: text/evil\r\n";
+        assert_eq!(passthrough_headers(raw), vec!["List-Id: <news.x.test>"]);
+    }
+
+    #[test]
+    fn passthrough_stops_at_the_end_of_the_header_block() {
+        let raw = "List-Id: <news.x.test>\r\n\r\nPrecedence: bulk in the body\r\n";
+        assert_eq!(passthrough_headers(raw), vec!["List-Id: <news.x.test>"]);
+    }
+
+    #[test]
+    fn passthrough_on_mail_without_original_headers_is_empty() {
+        assert!(passthrough_headers("").is_empty());
+    }
+
+    #[test]
     fn test_extract_headers_normal() {
         let rfc = "From: a@b.com\r\nTo: c@d.com\r\n\r\nBody here";
         let headers = extract_headers(rfc);
@@ -576,7 +723,7 @@ mod tests {
     #[test]
     fn test_mail_to_rfc2822_with_details() {
         use tutasdk::date::DateTime;
-        use tutasdk::entities::generated::tutanota::{Body, Recipients};
+        use tutasdk::entities::generated::tutanota::{Body, Header, Recipients};
         use tutasdk::IdTupleGenerated;
 
         let mail = Mail {
@@ -655,7 +802,18 @@ mod tests {
                 }],
                 bccRecipients: vec![],
             },
-            headers: None,
+            headers: Some(Header {
+                _id: None,
+                headers: Some(
+                    "Message-ID: <original@sender.test>\r\n\
+                     Content-Type: text/plain; boundary=\"stale\"\r\n\
+                     List-Unsubscribe: <https://x.test/u?id=1>\r\n\
+                     Precedence: bulk\r\n"
+                        .to_string(),
+                ),
+                compressedHeaders: None,
+                _errors: Default::default(),
+            }),
             body: Body {
                 _id: None,
                 text: Some("<p>Hello World</p>".to_string()),
@@ -669,6 +827,14 @@ mod tests {
         assert!(rfc.contains("From: sender@tuta.com\r\n"));
         assert!(rfc.contains("To: Bob <bob@example.com>, charlie@example.com\r\n"));
         assert!(rfc.contains("Cc: Dave <dave@example.com>\r\n"));
+        // Provenance headers ride along; structural ones from the original
+        // never do — the body below is ours, not the sender's.
+        assert!(rfc.contains("List-Unsubscribe: <https://x.test/u?id=1>\r\n"));
+        assert!(rfc.contains("Precedence: bulk\r\n"));
+        assert!(!rfc.contains("original@sender.test"));
+        assert!(!rfc.contains("stale"));
+        assert_eq!(rfc.matches("Message-ID:").count(), 1);
+        assert_eq!(rfc.matches("Content-Type:").count(), 1);
         // Body should be base64 of "<p>Hello World</p>"
         let body_b64 = base64::engine::general_purpose::STANDARD.encode(b"<p>Hello World</p>");
         assert!(rfc.contains(&body_b64));
