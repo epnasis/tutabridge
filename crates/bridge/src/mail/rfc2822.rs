@@ -87,6 +87,16 @@ fn sanitize_header_line(line: &str) -> String {
     line.replace(['\r', '\n'], " ")
 }
 
+/// Field names present in an original header block, for diagnostics. Names
+/// only — never values, which are message content.
+pub(crate) fn field_names(raw: &str) -> Vec<&str> {
+    raw.lines()
+        .take_while(|line| !line.is_empty())
+        .filter(|line| !line.starts_with(' ') && !line.starts_with('\t'))
+        .filter_map(|line| line.split_once(':').map(|(name, _)| name.trim()))
+        .collect()
+}
+
 pub fn mail_to_rfc2822(
     mail: &Mail,
     details: Option<&MailDetails>,
@@ -136,7 +146,18 @@ pub fn mail_to_rfc2822(
     }
 
     if let Some(raw) = details.and_then(original_headers) {
-        for header in passthrough_headers(raw) {
+        let kept = passthrough_headers(raw);
+        if kept.is_empty() {
+            // "Why is List-Unsubscribe missing?" has two very different
+            // answers — the sender never sent one, or we failed to parse the
+            // block — and from outside they look identical. Field names are
+            // not message content, so logging them is safe.
+            log::debug!(
+                "no provenance headers among: {}",
+                field_names(raw).join(", ")
+            );
+        }
+        for header in kept {
             msg.push_str(&header);
             msg.push_str("\r\n");
         }
@@ -633,6 +654,13 @@ mod tests {
     #[test]
     fn passthrough_on_mail_without_original_headers_is_empty() {
         assert!(passthrough_headers("").is_empty());
+    }
+
+    #[test]
+    fn field_names_lists_names_without_values() {
+        let raw =
+            "From: a@b.com\r\nList-Unsubscribe: <https://x.test/u>,\r\n\t<mailto:u@x.test>\r\n";
+        assert_eq!(field_names(raw), vec!["From", "List-Unsubscribe"]);
     }
 
     #[test]
