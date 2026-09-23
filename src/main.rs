@@ -173,6 +173,8 @@ async fn main() -> anyhow::Result<()> {
         let mut ws_watch = bus_client.state();
         let mut shutdown_watch = shutdown_rx.clone();
         let mut last = *ws_watch.borrow();
+        let status_path = tutabridge_core::config::connection_status_path();
+        tutabridge_core::status::record_or_log(&status_path, last);
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -180,6 +182,7 @@ async fn main() -> anyhow::Result<()> {
                         let now = *ws_watch.borrow();
                         if now != last {
                             info!("ws state: {:?} → {:?}", last, now);
+                            tutabridge_core::status::record_or_log(&status_path, now);
                             last = now;
                         }
                     }

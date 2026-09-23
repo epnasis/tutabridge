@@ -9,6 +9,7 @@ pub mod mail;
 pub mod mcp;
 mod net;
 pub mod smtp;
+pub mod status;
 pub mod store;
 pub mod sync;
 pub mod tls;

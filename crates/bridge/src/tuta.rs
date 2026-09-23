@@ -533,16 +533,23 @@ impl TutaSession {
             .zip(tokens_per_file.into_iter())
         {
             let enc_file_name = file_sk
-                .encrypt_data(att.filename.as_bytes(), InitializationVector::generate(randomizer))
+                .encrypt_data(
+                    att.filename.as_bytes(),
+                    InitializationVector::generate(randomizer),
+                )
                 .map_err(|e| {
                     ApiCallError::internal(format!("Failed to encrypt attachment name: {e}"))
                 })?;
             let enc_mime_type = file_sk
-                .encrypt_data(att.mime_type.as_bytes(), InitializationVector::generate(randomizer))
+                .encrypt_data(
+                    att.mime_type.as_bytes(),
+                    InitializationVector::generate(randomizer),
+                )
                 .map_err(|e| {
                     ApiCallError::internal(format!("Failed to encrypt attachment mime type: {e}"))
                 })?;
-            let owner_enc_file_sk = mail_group_key.encrypt_key(file_sk, InitializationVector::generate(randomizer));
+            let owner_enc_file_sk =
+                mail_group_key.encrypt_key(file_sk, InitializationVector::generate(randomizer));
 
             let new_draft = NewDraftAttachment {
                 _id: Some(random_custom_id(randomizer)),

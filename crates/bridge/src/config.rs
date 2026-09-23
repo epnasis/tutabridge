@@ -90,6 +90,10 @@ pub fn store_db_path() -> PathBuf {
     data_dir().join("store.db")
 }
 
+pub fn connection_status_path() -> PathBuf {
+    data_dir().join("status.json")
+}
+
 pub fn store_mails_dir() -> PathBuf {
     data_dir().join("mails")
 }

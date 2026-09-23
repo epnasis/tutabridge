@@ -314,6 +314,8 @@ impl BridgeHandle {
             // not on every internal `publish()` (some calls re-set the same
             // state).
             let mut last_ws_state = *ws_watch.borrow();
+            let status_path = crate::config::connection_status_path();
+            crate::status::record_or_log(&status_path, last_ws_state);
             tokio::spawn(async move {
                 // Initial pulse so a subscriber sees the freshly-started state.
                 let _ = stats_dirty.send(());
@@ -324,6 +326,7 @@ impl BridgeHandle {
                             let now = *ws_watch.borrow();
                             if now != last_ws_state {
                                 log::info!("ws state: {:?} → {:?}", last_ws_state, now);
+                                crate::status::record_or_log(&status_path, now);
                                 last_ws_state = now;
                             }
                             let _ = stats_dirty.send(());

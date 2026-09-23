@@ -439,7 +439,7 @@ impl ImapSession {
                     if let Some(eid) = &elem_id {
                         if self.store.body_fetch_on_cooldown(eid) {
                             return vec![format!(
-                                "{} NO [UNAVAILABLE] message body temporarily unavailable, try again later\r\n",
+                                "{} NO [UNAVAILABLE] message body not fetched: the last attempt failed and the bridge waits before retrying (see the bridge log for that error)\r\n",
                                 tag
                             )];
                         }
@@ -488,8 +488,9 @@ impl ImapSession {
                                 self.store.mark_body_fetch_failed(eid);
                             }
                             return vec![format!(
-                                "{} NO [UNAVAILABLE] could not fetch message body, try again later\r\n",
-                                tag
+                                "{} NO [UNAVAILABLE] could not fetch message body from Tuta: {}\r\n",
+                                tag,
+                                single_line(&e.to_string())
                             )];
                         }
                     }
@@ -1408,6 +1409,15 @@ fn apply_label_sets(
 /// trigger an on-demand fetch. Treating header/envelope requests as body
 /// requests made the client's list-building (one such fetch per message)
 /// download the entire mailbox.
+/// An error message made safe to embed in an IMAP response line: a CR or LF
+/// would end the line early and desynchronise the client.
+fn single_line(text: &str) -> String {
+    text.split(['\r', '\n'])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn needs_body(items: &str) -> bool {
     let u = items.to_uppercase();
     if u.contains("BODY[]") || u.contains("BODY.PEEK[]") {
@@ -1507,6 +1517,22 @@ fn append_literal_size(args: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn single_line_keeps_a_one_line_error_intact() {
+        assert_eq!(
+            super::single_line("ServerResponseError: Invalid Software Version"),
+            "ServerResponseError: Invalid Software Version"
+        );
+    }
+
+    #[test]
+    fn single_line_cannot_end_the_response_early() {
+        assert_eq!(
+            super::single_line("first\r\n* BYE injected\nlast"),
+            "first * BYE injected last"
+        );
+    }
+
     use super::*;
     use base64::Engine;
     use tutasdk::date::DateTime;
