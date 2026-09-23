@@ -109,3 +109,28 @@ cargo build -p tutabridge-core  # Core library only
 - `sdk-label-fixes` (epnasis/tutanota) — `load_range_tolerant` (per-entity
   decrypt fault tolerance) + empty-encrypted-value decrypt fix; pinned by
   main until upstreamed to spartanz51/tutanota `tutabridge-integration`
+- `sdk-360-rebase` (epnasis/tutanota) — every patch above cherry-picked onto
+  `tutanota-release-360.260921.0`; pinned by main since 2026-09-24. Push it
+  over SSH: upstream commits touch `.github/workflows`, which an HTTPS token
+  without the `workflow` scope may not push.
+
+### Tuta retires old client versions
+
+The SDK sends its crate version (`CLIENT_VERSION`, from the tuta-repo
+workspace `version`) as `cv` on every request and as `clientVersion` on the
+event-bus URL. Once Tuta stops accepting that version, every REST call and
+every websocket connect answers **474 Invalid Software Version**. That happened
+to `348.260528.0` on 2026-09-16, and the bridge served a frozen inbox for
+eight days. A restart does not help. The fix: cherry-pick our SDK patches
+onto a current `tutanota-release-*` tag, adapt the bridge to renamed APIs,
+redeploy. The log shows `ws connect failed: HTTP error: 474`, and
+`status.json` in the data dir carries the connection state for clients.
+
+### Every rebuild re-asks the Keychain
+
+The binary is ad-hoc signed with a per-build identifier, so the saved-session
+Keychain item's access list stops matching after every rebuild. On first start
+the bridge blocks in `SecKeychainFindGenericPassword` (the log stops at
+`Initializing SDK...`) until someone clicks **Always Allow** on the Mac's
+screen. Deploy only the final build: a grant given to an intermediate build is
+lost at the next one.
