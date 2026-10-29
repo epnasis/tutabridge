@@ -2735,6 +2735,33 @@ mod tests {
         assert!(local_store.has_eml(mail_id));
         // The flag must land on the row the upsert created, not before it.
         assert!(local_store.load_folder_metadata("inbox").unwrap()[0].has_details);
+        // And the body is searchable: the one-time backfill will not do it.
+        assert_eq!(
+            local_store.search_body("inline").unwrap(),
+            vec![mail_id.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_attachment_retry_completes_an_on_demand_fetch() {
+        let (_, backend, local_store, store) = on_demand_fetch(true).await;
+        *backend.fail_attachments.lock().unwrap() = false;
+        crate::sync::prefetch_details(
+            &store,
+            &local_store,
+            &*backend,
+            &inbox_folder(),
+            0,
+            &mut std::collections::HashMap::new(),
+        )
+        .await;
+        assert!(!store.get_folder("inbox").await[0].attachments_pending);
+        assert!(local_store.has_eml("od"));
+        assert!(local_store.load_folder_metadata("inbox").unwrap()[0].has_details);
+        assert_eq!(
+            local_store.search_body("quokka").unwrap(),
+            vec!["od".to_string()]
+        );
     }
 
     #[tokio::test]

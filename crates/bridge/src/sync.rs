@@ -849,7 +849,7 @@ pub(crate) async fn sync_folder(
     Ok(())
 }
 
-async fn prefetch_details(
+pub(crate) async fn prefetch_details(
     store: &MailStore,
     local_store: &LocalStore,
     backend: &dyn MailBackend,
@@ -1033,6 +1033,15 @@ async fn prefetch_details(
                 let rfc2822 = mail_to_rfc2822(&stored.mail, Some(details), &refs);
                 if let Err(e) = local_store.write_eml(&eid, &rfc2822) {
                     warn!("Failed to rewrite eml {}: {}", eid, e);
+                } else {
+                    // A mail first fetched on demand reaches this pass with
+                    // neither done: it was not persisted without attachments.
+                    if let Err(e) = local_store.mark_has_details(&eid) {
+                        warn!("Failed to mark has_details {}: {}", eid, e);
+                    }
+                    if let Err(e) = local_store.index_body(&eid, &strip_html(body_html(details))) {
+                        warn!("Failed to index body {}: {}", eid, e);
+                    }
                 }
                 store.update_mail_rfc2822(&folder.id, &eid, rfc2822).await;
                 attachment_retry_history.remove(&eid);
@@ -1098,6 +1107,16 @@ where
         }
     }
     unreachable!()
+}
+
+/// A mail's HTML body as Tuta stores it (compressed or not).
+pub(crate) fn body_html(details: &MailDetails) -> &str {
+    details
+        .body
+        .compressedText
+        .as_deref()
+        .or(details.body.text.as_deref())
+        .unwrap_or("")
 }
 
 pub(crate) fn mail_to_metadata(mail: &Mail, folder_id: &str, uid: u32) -> MailMetadata {

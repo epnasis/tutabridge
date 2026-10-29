@@ -443,11 +443,18 @@ pub(crate) async fn apply_mail_set_entry_create(
         // Persist the body straight away so the IMAP layer can serve FETCH
         // BODY[] without a placeholder, and the prefetch loop skips it. After
         // the upsert: before it, a new mail has no row for the flag to land in.
-        if let Some(eml) = rfc2822.as_deref() {
+        if let (Some(eml), Some(details)) = (rfc2822.as_deref(), details.as_ref()) {
             if let Err(e) = local_store.write_eml(&mail_eid, eml) {
                 warn!("Failed to cache eml for {}: {e}", mail_eid);
-            } else if let Err(e) = local_store.mark_has_details(&mail_eid) {
-                warn!("Failed to mark has_details for {}: {e}", mail_eid);
+            } else {
+                if let Err(e) = local_store.mark_has_details(&mail_eid) {
+                    warn!("Failed to mark has_details for {}: {e}", mail_eid);
+                }
+                // The one-time FTS backfill has run; new mail is indexed here.
+                let text = crate::mail::strip_html(crate::sync::body_html(details));
+                if let Err(e) = local_store.index_body(&mail_eid, &text) {
+                    warn!("Failed to index body for {}: {e}", mail_eid);
+                }
             }
         }
         return;
