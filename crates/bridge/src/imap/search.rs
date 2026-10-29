@@ -12,19 +12,37 @@
 //! per-term hit sets to [`matches`] via a [`SearchContext`]. A body term only
 //! matches messages whose body has actually been downloaded and indexed.
 //!
-//! Robustness rule: an unrecognised criterion degrades to a non-restrictive
-//! match (it never *hides* messages). Over-inclusion is the safe failure for
-//! search; silently dropping a matching mail is not.
+//! Robustness rule: a criterion the parser cannot read exactly — unknown,
+//! malformed, missing its argument — is [`SearchKey::Invalid`] and the whole
+//! SEARCH answers BAD. A fallback would be a silent wrong answer: matching
+//! all hides nothing but ignores the criterion, and under `NOT` it becomes
+//! an empty success indistinguishable from "no such mail" (issue #16).
 
 use std::collections::{HashMap, HashSet};
 
-/// One element of an IMAP sequence/UID set, e.g. `1`, `3:9`, or `5:*`.
+/// A number in a sequence/UID set: `*` is the largest one in the mailbox,
+/// known only when matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeqNum {
+    Num(u32),
+    Star,
+}
+
+impl SeqNum {
+    fn resolve(self, max: u32) -> u32 {
+        match self {
+            SeqNum::Num(n) => n,
+            SeqNum::Star => max,
+        }
+    }
+}
+
+/// One element of an IMAP sequence/UID set, e.g. `1`, `3:9`, or `5:*`. Its
+/// ends may come in either order (RFC 3501: `5:2` is `2:5`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SeqRange {
-    start: u32,
-    /// `None` represents `*` (the largest value present). Since any concrete
-    /// value is `<=` the max, an open-ended range is just `value >= start`.
-    end: Option<u32>,
+    first: SeqNum,
+    last: SeqNum,
 }
 
 /// A parsed sequence or UID set (comma-separated [`SeqRange`]s).
@@ -34,17 +52,13 @@ pub struct SeqSet {
 }
 
 impl SeqSet {
-    fn contains(&self, value: u32) -> bool {
-        self.ranges.iter().any(|r| match r.end {
-            None => value >= r.start,
-            Some(end) => {
-                let (lo, hi) = if r.start <= end {
-                    (r.start, end)
-                } else {
-                    (end, r.start)
-                };
-                value >= lo && value <= hi
-            }
+    /// `max` is the largest sequence number or UID in the mailbox, which `*`
+    /// stands for: `*` alone is that one message, and `n:*` with `n` above it
+    /// still includes it.
+    fn contains(&self, value: u32, max: u32) -> bool {
+        self.ranges.iter().any(|r| {
+            let (a, b) = (r.first.resolve(max), r.last.resolve(max));
+            (a.min(b)..=a.max(b)).contains(&value)
         })
     }
 }
@@ -142,6 +156,9 @@ pub struct MsgView<'a> {
 #[derive(Default)]
 pub struct SearchContext {
     pub body_hits: HashMap<String, HashSet<String>>,
+    /// The values `*` stands for in sequence and UID sets.
+    pub max_seq: u32,
+    pub max_uid: u32,
 }
 
 impl SearchContext {
@@ -252,9 +269,9 @@ pub fn matches(key: &SearchKey, m: &MsgView, ctx: &SearchContext) -> bool {
         SearchKey::Larger(n) => m.size > *n,
         SearchKey::Smaller(n) => m.size < *n,
 
-        SearchKey::Uid(set) => set.contains(m.uid),
+        SearchKey::Uid(set) => set.contains(m.uid, ctx.max_uid),
         SearchKey::Invalid(_) => false,
-        SearchKey::Sequence(set) => set.contains(m.seq),
+        SearchKey::Sequence(set) => set.contains(m.seq, ctx.max_seq),
     }
 }
 
@@ -270,6 +287,8 @@ enum Token {
     Atom(String),
     /// A double-quoted string argument (may hold spaces / UTF-8).
     Quoted(String),
+    /// A quoted string the input ended inside.
+    Unterminated,
 }
 
 fn tokenize(input: &str) -> Vec<Token> {
@@ -291,6 +310,7 @@ fn tokenize(input: &str) -> Vec<Token> {
             '"' => {
                 chars.next(); // opening quote
                 let mut s = String::new();
+                let mut closed = false;
                 while let Some(ch) = chars.next() {
                     match ch {
                         '\\' => {
@@ -298,11 +318,18 @@ fn tokenize(input: &str) -> Vec<Token> {
                                 s.push(escaped);
                             }
                         }
-                        '"' => break,
+                        '"' => {
+                            closed = true;
+                            break;
+                        }
                         _ => s.push(ch),
                     }
                 }
-                tokens.push(Token::Quoted(s));
+                tokens.push(if closed {
+                    Token::Quoted(s)
+                } else {
+                    Token::Unterminated
+                });
             }
             _ => {
                 let mut s = String::new();
@@ -435,6 +462,7 @@ fn parse_key(tokens: &[Token], i: &mut usize) -> Option<SearchKey> {
             })
         }
         Token::RParen => None,
+        Token::Unterminated => Some(SearchKey::Invalid("unterminated quoted string".to_owned())),
         Token::Quoted(text) => Some(SearchKey::Invalid(format!(
             "{} is not a search key",
             echo(&text)
@@ -507,8 +535,10 @@ fn parse_atom_key(atom: &str, tokens: &[Token], i: &mut usize) -> SearchKey {
         "SMALLER" => size_key(tokens, i, "SMALLER", SearchKey::Smaller),
 
         "UID" => match next_arg(tokens, i) {
-            Some(set) if is_seqset(&set) => SearchKey::Uid(parse_seqset(&set)),
-            Some(other) => SearchKey::Invalid(format!("UID {} is not a set", echo(&other))),
+            Some(text) => match parse_seqset(&text) {
+                Some(set) => SearchKey::Uid(set),
+                None => SearchKey::Invalid(format!("UID {} is not a set", echo(&text))),
+            },
             None => SearchKey::Invalid("UID needs a set".to_owned()),
         },
 
@@ -516,7 +546,10 @@ fn parse_atom_key(atom: &str, tokens: &[Token], i: &mut usize) -> SearchKey {
         // own; anything else is a key we do not know.
         _ => {
             if is_seqset(atom) {
-                SearchKey::Sequence(parse_seqset(atom))
+                match parse_seqset(atom) {
+                    Some(set) => SearchKey::Sequence(set),
+                    None => SearchKey::Invalid(format!("{} is not a set", echo(atom))),
+                }
             } else {
                 SearchKey::Invalid(format!("unknown search key {}", echo(atom)))
             }
@@ -551,10 +584,13 @@ fn date_key(tokens: &[Token], i: &mut usize, name: &str, ctor: fn(i64) -> Search
 
 fn size_key(tokens: &[Token], i: &mut usize, name: &str, ctor: fn(u64) -> SearchKey) -> SearchKey {
     match next_arg(tokens, i) {
-        Some(text) => match text.parse::<u64>() {
-            Ok(n) => ctor(n),
-            Err(_) => SearchKey::Invalid(format!("{name} {} is not a size", echo(&text))),
-        },
+        Some(text) if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) => {
+            match text.parse::<u64>() {
+                Ok(n) => ctor(n),
+                Err(_) => SearchKey::Invalid(format!("{name} {} is too large", echo(&text))),
+            }
+        }
+        Some(text) => SearchKey::Invalid(format!("{name} {} is not a size", echo(&text))),
         None => SearchKey::Invalid(format!("{name} needs a size")),
     }
 }
@@ -565,39 +601,49 @@ fn is_seqset(s: &str) -> bool {
             .all(|c| c.is_ascii_digit() || c == ':' || c == ',' || c == '*')
 }
 
-fn parse_seqset(s: &str) -> SeqSet {
-    let mut ranges = Vec::new();
-    for part in s.split(',') {
-        if part.is_empty() {
-            continue;
+/// RFC 3501 `sequence-set`: comma-separated `seq-number` or
+/// `seq-number:seq-number`, where a `seq-number` is a non-zero number or `*`.
+/// `None` for anything else.
+fn parse_seqset(s: &str) -> Option<SeqSet> {
+    let seq_number = |text: &str| -> Option<SeqNum> {
+        if text == "*" {
+            return Some(SeqNum::Star);
         }
-        if let Some((a, b)) = part.split_once(':') {
-            let start = if a == "*" { 0 } else { a.parse().unwrap_or(0) };
-            let end = if b == "*" { None } else { b.parse().ok() };
-            ranges.push(SeqRange { start, end });
-        } else if part == "*" {
-            ranges.push(SeqRange {
-                start: 0,
-                end: None,
-            });
-        } else if let Ok(n) = part.parse::<u32>() {
-            ranges.push(SeqRange {
-                start: n,
-                end: Some(n),
-            });
+        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
         }
-    }
-    SeqSet { ranges }
+        text.parse().ok().filter(|&n| n != 0).map(SeqNum::Num)
+    };
+    let ranges = s
+        .split(',')
+        .map(|part| {
+            let (first, last) = part.split_once(':').unwrap_or((part, part));
+            Some(SeqRange {
+                first: seq_number(first)?,
+                last: seq_number(last)?,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(SeqSet { ranges })
 }
 
 /// Parse an IMAP date (`dd-Mon-yyyy`, e.g. `1-Feb-2020`) into a day number.
 fn parse_imap_date(s: &str) -> Option<i64> {
+    // RFC 3501: date-day = 1*2DIGIT, date-year = 4DIGIT. A lenient reading
+    // turns `1-Jan-24` into the year 24 or `31-Feb` into March: a silent
+    // wrong answer rather than an error.
+    let digits = |text: &str, lengths: std::ops::RangeInclusive<usize>| {
+        lengths.contains(&text.len()) && text.bytes().all(|b| b.is_ascii_digit())
+    };
     let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 3 {
+    let [day, month, year] = parts[..] else {
+        return None;
+    };
+    if !digits(day, 1..=2) || !digits(year, 4..=4) {
         return None;
     }
-    let day: i64 = parts[0].parse().ok()?;
-    let month = match parts[1].to_lowercase().as_str() {
+    let (day, year): (i64, i64) = (day.parse().ok()?, year.parse().ok()?);
+    let month = match month.to_lowercase().as_str() {
         "jan" => 1,
         "feb" => 2,
         "mar" => 3,
@@ -612,7 +658,16 @@ fn parse_imap_date(s: &str) -> Option<i64> {
         "dec" => 12,
         _ => return None,
     };
-    let year: i64 = parts[2].parse().ok()?;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if !(1..=days_in_month).contains(&day) {
+        return None;
+    }
     Some(days_from_civil(year, month, day))
 }
 
@@ -692,7 +747,10 @@ mod tests {
         for t in terms {
             body_hits.insert((*t).to_string(), HashSet::from(["mail1".to_string()]));
         }
-        SearchContext { body_hits }
+        SearchContext {
+            body_hits,
+            ..Default::default()
+        }
     }
 
     fn no_ctx() -> SearchContext {
@@ -794,8 +852,14 @@ mod tests {
 
     #[test]
     fn parse_seqset_and_uid() {
-        assert_eq!(parse("1:5"), SearchKey::Sequence(parse_seqset("1:5")));
-        assert_eq!(parse("UID 3:*"), SearchKey::Uid(parse_seqset("3:*")));
+        assert_eq!(
+            parse("1:5"),
+            SearchKey::Sequence(parse_seqset("1:5").unwrap())
+        );
+        assert_eq!(
+            parse("UID 3:*"),
+            SearchKey::Uid(parse_seqset("3:*").unwrap())
+        );
     }
 
     #[test]
@@ -856,20 +920,52 @@ mod tests {
 
     #[test]
     fn seqset_membership() {
-        let s = parse_seqset("1,3,5:9");
-        assert!(s.contains(1));
-        assert!(!s.contains(2));
-        assert!(s.contains(3));
-        assert!(s.contains(7));
-        assert!(!s.contains(10));
+        let s = parse_seqset("1,3,5:9").unwrap();
+        assert!(s.contains(1, 20));
+        assert!(!s.contains(2, 20));
+        assert!(s.contains(3, 20));
+        assert!(s.contains(7, 20));
+        assert!(!s.contains(10, 20));
+        // Ends in either order.
+        assert!(parse_seqset("9:5").unwrap().contains(7, 20));
     }
 
     #[test]
-    fn seqset_open_ended_star() {
-        let s = parse_seqset("100:*");
-        assert!(!s.contains(99));
-        assert!(s.contains(100));
-        assert!(s.contains(999_999));
+    fn seqset_star_is_the_largest_value() {
+        let open = parse_seqset("100:*").unwrap();
+        assert!(!open.contains(99, 500));
+        assert!(open.contains(100, 500));
+        assert!(open.contains(500, 500));
+        // `*` alone is that one message, not every one.
+        let star = parse_seqset("*").unwrap();
+        assert!(star.contains(500, 500));
+        assert!(!star.contains(1, 500));
+        // `n:*` above the largest still includes the largest (RFC 3501).
+        assert!(parse_seqset("900:*").unwrap().contains(500, 500));
+    }
+
+    #[test]
+    fn malformed_sets_dates_and_sizes_are_invalid() {
+        for set in [":", "1:2:3", ",", "1,", "0", "1:0", "a", "1:a"] {
+            assert!(parse_seqset(set).is_none(), "{set}");
+        }
+        for query in [
+            ":",
+            "UID 0",
+            "UID ,",
+            "SINCE 1-Jan-24",
+            "SINCE 99-Jan-2024",
+            "SINCE 31-Feb-2024",
+            "SINCE 29-Feb-2023",
+            "SINCE +1-Jan-2024",
+            "LARGER +5",
+            "SUBJECT \"unterminated",
+        ] {
+            assert!(parse(query).invalid_reason().is_some(), "{query}");
+        }
+        for query in ["SINCE 29-Feb-2024", "SINCE 01-Jan-2024", "SINCE 1-jan-2024"] {
+            assert!(parse(query).invalid_reason().is_none(), "{query}");
+        }
     }
 
     // --- matcher ---
@@ -995,9 +1091,21 @@ mod tests {
     fn match_uid_and_seq() {
         let v = view(); // seq 1, uid 10
         let c = no_ctx();
-        assert!(matches(&SearchKey::Uid(parse_seqset("5:15")), &v, &c));
-        assert!(!matches(&SearchKey::Uid(parse_seqset("1:5")), &v, &c));
-        assert!(matches(&SearchKey::Sequence(parse_seqset("1")), &v, &c));
+        assert!(matches(
+            &SearchKey::Uid(parse_seqset("5:15").unwrap()),
+            &v,
+            &c
+        ));
+        assert!(!matches(
+            &SearchKey::Uid(parse_seqset("1:5").unwrap()),
+            &v,
+            &c
+        ));
+        assert!(matches(
+            &SearchKey::Sequence(parse_seqset("1").unwrap()),
+            &v,
+            &c
+        ));
     }
 
     #[test]

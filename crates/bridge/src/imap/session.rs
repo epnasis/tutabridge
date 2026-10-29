@@ -622,6 +622,8 @@ impl ImapSession {
     /// empty, so body terms match nothing.
     fn resolve_body_search(&self, query: &search::SearchKey) -> search::SearchContext {
         let mut ctx = search::SearchContext::empty();
+        ctx.max_seq = self.mails.len() as u32;
+        ctx.max_uid = self.mails.iter().map(|m| m.uid).max().unwrap_or(0);
         let Some(local_store) = &self.local_store else {
             return ctx;
         };
@@ -2432,6 +2434,9 @@ mod tests {
         let resp = session.handle_command("e SEARCH KEYWORD NoSuchTag").await;
         assert_eq!(resp[0], "* SEARCH \r\n");
         // A malformed one is an error, never an empty success.
+        // `*` is the last message only (RFC 3501), not all of them.
+        let resp = session.handle_command("g SEARCH *").await;
+        assert_eq!(resp[0], "* SEARCH 2\r\n");
         let resp = session.handle_command("f UID SEARCH KEYWORD").await;
         assert!(resp[0].starts_with("f BAD "), "{resp:?}");
         assert_eq!(resp.len(), 1);
