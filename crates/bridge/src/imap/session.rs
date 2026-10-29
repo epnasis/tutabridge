@@ -625,12 +625,13 @@ impl ImapSession {
         }
     }
 
-    /// Resolve the `BODY`/`TEXT` terms of a query against the full-text index,
-    /// once per distinct term. With no local store (unit tests) the context is
-    /// empty, so body terms match nothing.
-    /// Resolve the `BODY`/`TEXT` terms against the full-text index. An index
-    /// failure, or a term the index cannot express (punctuation only), is an
-    /// error: "no hits" would be an empty success that is not true.
+    /// Resolve the `BODY`/`TEXT` terms against the full-text index, once per
+    /// distinct term. An index failure, or a term with no alphanumeric
+    /// character (`char::is_alphanumeric`), is an error: "no hits" would be an
+    /// empty success that is not true. The index's tokenizer drops a few more
+    /// characters than that test (some combining marks, superscripts), so a
+    /// term made only of those still answers empty. With no local store (unit
+    /// tests) body terms match nothing.
     fn resolve_body_search(
         &self,
         query: &search::SearchKey,
@@ -647,8 +648,8 @@ impl ImapSession {
             }
             if crate::store::fts_match_expr(&term).is_empty() {
                 return Err(format!(
-                    "[CANNOT] body search needs letters or digits, not {:?}",
-                    term.escape_default().to_string()
+                    "[CANNOT] body search needs letters or digits, not \"{}\"",
+                    term.escape_default()
                 ));
             }
             match local_store.search_body(&term) {
@@ -1340,16 +1341,13 @@ fn format_envelope_addr(addr: &tutasdk::entities::generated::tutanota::MailAddre
     )
 }
 
+/// The sequence set is the first word; a set never holds a space or a `(`,
+/// while a single unparenthesised item can (`BODY.PEEK[HEADER.FIELDS (FROM)]`).
 fn parse_fetch_args(args: &str) -> (String, String) {
-    if let Some(paren_start) = args.find('(') {
-        let seq = args[..paren_start].trim().to_string();
-        let items = args[paren_start..].trim().to_string();
-        (seq, items)
-    } else {
-        let parts: Vec<&str> = args.splitn(2, ' ').collect();
-        let seq = parts.first().unwrap_or(&"").to_string();
-        let items = parts.get(1).unwrap_or(&"").to_string();
-        (seq, items)
+    let args = args.trim();
+    match args.split_once(|c: char| c == ' ' || c == '(') {
+        Some((seq, _)) => (seq.to_string(), args[seq.len()..].trim().to_string()),
+        None => (args.to_string(), String::new()),
     }
 }
 
@@ -1719,6 +1717,15 @@ mod tests {
         let (seq, items) = parse_fetch_args("1:* (FLAGS UID)");
         assert_eq!(seq, "1:*");
         assert_eq!(items, "(FLAGS UID)");
+    }
+
+    #[test]
+    fn parse_fetch_args_single_item_with_brackets() {
+        let (seq, items) = parse_fetch_args("1 BODY.PEEK[HEADER.FIELDS (FROM)]");
+        assert_eq!(seq, "1");
+        assert_eq!(items, "BODY.PEEK[HEADER.FIELDS (FROM)]");
+        let (seq, items) = parse_fetch_args("1:*(FLAGS)");
+        assert_eq!((seq.as_str(), items.as_str()), ("1:*", "(FLAGS)"));
     }
 
     #[test]
