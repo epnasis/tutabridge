@@ -525,10 +525,11 @@ impl ImapSession {
                             // attachments, it is persisted too, with the pending
                             // flag the syncer's retry pass completes it from.
                             if let (Some(eid), Some(ls)) = (&elem_id, &self.local_store) {
-                                if attachments_pending {
-                                    if let Err(e) = ls.set_attachments_pending(eid, true) {
-                                        warn!("Failed to mark attachments pending {eid}: {e}");
-                                    }
+                                // Set or cleared: a complete fetch ends a pending
+                                // state the database may still hold.
+                                if let Err(e) = ls.set_attachments_pending(eid, attachments_pending)
+                                {
+                                    warn!("Failed to record attachments pending {eid}: {e}");
                                 }
                                 if let Err(e) = ls.write_eml(eid, &rfc) {
                                     warn!("Failed to cache eml {eid}: {e}");
@@ -2726,6 +2727,64 @@ mod tests {
             "the flag survives the restart"
         );
         assert!(restored[0].details.is_none());
+        crate::sync::prefetch_details(
+            &store,
+            &local_store,
+            &*backend,
+            &inbox_folder(),
+            0,
+            &mut std::collections::HashMap::new(),
+        )
+        .await;
+        assert!(!store.get_folder("inbox").await[0].attachments_pending);
+        assert!(local_store
+            .attachments_pending_in("inbox")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pending_mail_without_its_body_is_rendered_not_emptied() {
+        let (_, backend, local_store, store) = on_demand_fetch(true).await;
+        // The cached rendition is gone (a rendition drop, say): memory has
+        // no body, the database still says pending.
+        local_store.delete_eml("od").unwrap();
+        let mut gone = store.get_folder("inbox").await[0].clone();
+        gone.rfc2822 = None;
+        gone.details = None;
+        store.set_folder("inbox", vec![gone]).await;
+        *backend.attachments_fail_for_good.lock().unwrap() = true;
+        crate::sync::prefetch_details(
+            &store,
+            &local_store,
+            &*backend,
+            &inbox_folder(),
+            0,
+            &mut std::collections::HashMap::new(),
+        )
+        .await;
+        let mail = &store.get_folder("inbox").await[0];
+        assert!(
+            mail.rfc2822
+                .as_deref()
+                .is_some_and(|r| r.contains("Subject")),
+            "the body must come back, not be emptied"
+        );
+        assert!(local_store.has_eml("od"));
+        // Re-rendered (body-only, attachments gone for good): no longer pending.
+        assert!(local_store
+            .attachments_pending_in("inbox")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_mail_pending_for_days_gives_up_despite_a_fresh_count() {
+        let (_, backend, local_store, store) = on_demand_fetch(true).await;
+        // Pending since the epoch: far past the age limit, though this
+        // process has not tried it yet.
+        local_store.exec_for_test("UPDATE mails SET attachments_pending = 1");
+        let _ = backend;
         crate::sync::prefetch_details(
             &store,
             &local_store,

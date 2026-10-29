@@ -594,12 +594,35 @@ impl LocalStore {
         element_id: &str,
         pending: bool,
     ) -> Result<(), StoreError> {
+        // The column holds when the mail first went pending (0 = not): the
+        // retry pass gives up by age, which a restart does not reset.
         let conn = self.conn.lock().unwrap();
+        let since_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(1, |d| d.as_millis() as i64);
         conn.execute(
-            "UPDATE mails SET attachments_pending = ?2 WHERE element_id = ?1",
-            rusqlite::params![element_id, pending as i64],
+            "UPDATE mails SET attachments_pending = CASE
+                 WHEN ?2 = 0 THEN 0
+                 WHEN attachments_pending = 0 THEN ?2
+                 ELSE attachments_pending END
+             WHERE element_id = ?1",
+            rusqlite::params![element_id, if pending { since_ms } else { 0 }],
         )?;
         Ok(())
+    }
+
+    /// When a mail's attachments first failed, in Unix ms; `None` when it is
+    /// not pending.
+    pub fn attachments_pending_since(&self, element_id: &str) -> Result<Option<i64>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let since: Option<i64> = conn
+            .query_row(
+                "SELECT attachments_pending FROM mails WHERE element_id = ?1",
+                [element_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(since.filter(|&ms| ms != 0))
     }
 
     pub fn attachments_pending_in(
@@ -608,7 +631,7 @@ impl LocalStore {
     ) -> Result<std::collections::HashSet<String>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT element_id FROM mails WHERE folder_id = ?1 AND attachments_pending = 1",
+            "SELECT element_id FROM mails WHERE folder_id = ?1 AND attachments_pending != 0",
         )?;
         let ids = stmt
             .query_map([folder_id], |row| row.get(0))?
