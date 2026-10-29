@@ -33,6 +33,25 @@ value cannot smuggle a structural header in. Absent headers are normal
 changing what this function emits only affects mail rendered after the
 change. Mail already in the cache keeps its old headers until re-rendered.
 
+### IMAP SEARCH: an error, never a false answer
+
+`imap/search.rs` reads a SEARCH exactly or not at all (issue #16): any
+criterion it cannot read — unknown key, malformed set/date/size, missing
+argument, unbalanced parens, literal `{N}`, unterminated quote — parses to
+`SearchKey::Invalid` and the command answers BAD. A fallback ("match all")
+would be a silent wrong answer, and under `NOT` an empty success. Other
+rules:
+- `*` is the largest sequence number / UID (`SearchContext.max_*`).
+- FETCH/STORE/MOVE share the strict `parse_seqset` (BAD when malformed).
+- `KEYWORD` matches label keywords exactly as FETCH FLAGS reports them.
+- Body terms are quoted FTS5 words; an index error answers
+  `NO [UNAVAILABLE]`, a term without alphanumerics `NO [CANNOT]`, a
+  charset other than US-ASCII/UTF-8 `NO [BADCHARSET]`.
+- Not covered: the index matches word prefixes, so a substring in the
+  middle of a CJK run is not found. Accents fold (`gesla` finds "gęślą"),
+  but letters that are not base + accent do not (`zazolc` misses
+  "zażółć": `ł` is its own letter) — checked with SQLite 3.50.4's FTS5.
+
 ### Labels ↔ IMAP keywords
 
 Tuta labels (`MailSet`s with `kind == Label`) are exposed as IMAP keywords
