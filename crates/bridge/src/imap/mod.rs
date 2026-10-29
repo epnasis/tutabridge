@@ -165,16 +165,19 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    let refusal = if req.literal_size > MAX_APPEND_BYTES {
+    // Logged in first: a draft is real mail in the user's account.
+    let target = session.append_target(&req.mailbox).await;
+    let refusal = if !session.is_authenticated() {
+        Some(format!("{} NO Not authenticated\r\n", req.tag))
+    } else if req.literal_size > MAX_APPEND_BYTES {
         Some(format!("{} NO [TOOBIG] message too large\r\n", req.tag))
+    } else if matches!(target, session::AppendTarget::Other) {
+        Some(format!(
+            "{} NO [CANNOT] APPEND is supported for Sent (kept by Tuta) and Drafts only\r\n",
+            req.tag
+        ))
     } else {
-        match session.append_target(&req.mailbox).await {
-            session::AppendTarget::Other => Some(format!(
-                "{} NO [CANNOT] APPEND is supported for Sent (kept by Tuta) and Drafts only\r\n",
-                req.tag
-            )),
-            _ => None,
-        }
+        None
     };
     if let Some(refusal) = refusal {
         if req.non_sync {
@@ -194,7 +197,9 @@ where
     let mut tail = String::new();
     reader.read_line(&mut tail).await?;
 
-    let resp = match session.append_target(&req.mailbox).await {
+    // The target as decided above, not looked up again: the folder list may
+    // have changed while the literal arrived.
+    let resp = match target {
         session::AppendTarget::Drafts(drafts) => {
             session.append_draft(&req.tag, &drafts, &message).await
         }
@@ -338,7 +343,9 @@ mod tests {
             special_use: Some("\\Sent".into()),
         };
         store.set_folder_list(vec![sent]).await;
-        ImapSession::new(store, Arc::new(NoopBackend::default()), None, None)
+        let mut session = ImapSession::new(store, Arc::new(NoopBackend::default()), None, None);
+        session.handle_command("a LOGIN u p").await;
+        session
     }
 
     #[tokio::test]
@@ -367,7 +374,8 @@ mod tests {
             }])
             .await;
         let backend = Arc::new(NoopBackend::default());
-        let session = ImapSession::new(store, backend.clone(), None, Some(local_store.clone()));
+        let mut session = ImapSession::new(store, backend.clone(), None, Some(local_store.clone()));
+        session.handle_command("a LOGIN u p").await;
 
         let message = b"Subject: plan\r\nTo: a@x.test\r\n\r\nbody\r\n";
         let (mut client, server) = tokio::io::duplex(4096);
@@ -422,6 +430,35 @@ mod tests {
         let mut next = String::new();
         reader.read_line(&mut next).await.unwrap();
         assert_eq!(next, "n2 NOOP\r\n");
+    }
+
+    #[tokio::test]
+    async fn append_before_login_creates_nothing() {
+        let store = MailStore::new();
+        store
+            .set_folder_list(vec![FolderInfo {
+                id: "drafts".into(),
+                list_id: "folders".into(),
+                entries_list_id: "de".into(),
+                kind: MailSetKind::Draft,
+                imap_path: "Drafts".into(),
+                special_use: Some("\\Drafts".into()),
+            }])
+            .await;
+        let backend = Arc::new(NoopBackend::default());
+        let session = ImapSession::new(store, backend.clone(), Some("secret".into()), None);
+        let (mut client, server) = tokio::io::duplex(4096);
+        let (sr, mut sw) = tokio::io::split(server);
+        let mut reader = BufReader::new(sr);
+        let req = session::parse_append("p1 APPEND Drafts {7+}").unwrap();
+        client.write_all(b"preauth\r\n").await.unwrap();
+        handle_append(&mut reader, &mut sw, &session, req)
+            .await
+            .unwrap();
+        let mut resp = vec![0u8; 128];
+        let n = client.read(&mut resp).await.unwrap();
+        assert!(String::from_utf8_lossy(&resp[..n]).starts_with("p1 NO"));
+        assert!(backend.drafts.lock().unwrap().is_empty());
     }
 
     #[test]

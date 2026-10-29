@@ -515,18 +515,26 @@ impl LocalStore {
         Ok(())
     }
 
+    /// Forget the mails a folder listing no longer holds. `listed_below_uid`
+    /// is the folder's next UID from before the listing was fetched: a mail
+    /// given a UID since then (an APPEND, an event) cannot be in the listing
+    /// yet and is kept, along with its UID.
     pub fn delete_mails_not_in(
         &self,
         folder_id: &str,
         element_ids: &[&str],
+        listed_below_uid: u32,
     ) -> Result<Vec<String>, StoreError> {
         let conn = self.conn.lock().unwrap();
 
         let mut deleted = Vec::new();
         {
-            let mut stmt = conn.prepare("SELECT element_id FROM mails WHERE folder_id = ?1")?;
+            let mut stmt =
+                conn.prepare("SELECT element_id FROM mails WHERE folder_id = ?1 AND uid < ?2")?;
             let existing: Vec<String> = stmt
-                .query_map([folder_id], |row| row.get(0))?
+                .query_map(rusqlite::params![folder_id, listed_below_uid], |row| {
+                    row.get(0)
+                })?
                 .filter_map(|r| r.ok())
                 .collect();
 
@@ -542,11 +550,13 @@ impl LocalStore {
         // UIDs held in this folder by mails it no longer lists, including
         // ones whose row already points at the folder they moved to.
         let released: Vec<String> = {
-            let mut stmt =
-                conn.prepare("SELECT element_id FROM folder_uids WHERE folder_id = ?1")?;
+            let mut stmt = conn
+                .prepare("SELECT element_id FROM folder_uids WHERE folder_id = ?1 AND uid < ?2")?;
             let keep: std::collections::HashSet<&str> = element_ids.iter().copied().collect();
             let held: Vec<String> = stmt
-                .query_map([folder_id], |row| row.get(0))?
+                .query_map(rusqlite::params![folder_id, listed_below_uid], |row| {
+                    row.get(0)
+                })?
                 .filter_map(|r| r.ok())
                 .collect();
             held.into_iter()
@@ -970,7 +980,9 @@ mod tests {
         store
             .upsert_mail_metadata(&meta("x", "archive", 0))
             .unwrap();
-        store.delete_mails_not_in("inbox", &["y"]).unwrap();
+        store
+            .delete_mails_not_in("inbox", &["y"], u32::MAX)
+            .unwrap();
         assert_eq!(store.assign_folder_uids("inbox", &["x"]).unwrap()["x"], 3);
         assert_eq!(store.assign_folder_uids("inbox", &["y"]).unwrap()["y"], 2);
     }
@@ -1031,7 +1043,7 @@ mod tests {
         store.upsert_mail_metadata_batch(&metas).unwrap();
 
         let keep = vec!["mail_0", "mail_2", "mail_4"];
-        let deleted = store.delete_mails_not_in("inbox", &keep).unwrap();
+        let deleted = store.delete_mails_not_in("inbox", &keep, u32::MAX).unwrap();
         assert_eq!(deleted.len(), 2);
         assert!(deleted.contains(&"mail_1".to_string()));
         assert!(deleted.contains(&"mail_3".to_string()));
@@ -1263,5 +1275,27 @@ mod tests {
         assert_eq!(store.drop_stale_renditions().unwrap(), 0);
         assert!(store.has_eml("old"));
         assert!(store.load_folder_metadata("inbox").unwrap()[0].has_details);
+    }
+
+    #[test]
+    fn a_listing_never_releases_uids_given_out_after_it_started() {
+        let store = open_memory_store();
+        store.assign_folder_uids("drafts", &["old"]).unwrap();
+        // The listing starts; its threshold is the next UID at that moment.
+        let (_, listed_below_uid) = store.folder_uid_state("drafts").unwrap();
+        // An APPEND lands meanwhile and is given the next UID.
+        store.assign_folder_uids("drafts", &["new"]).unwrap();
+        // The listing knew neither.
+        store
+            .delete_mails_not_in("drafts", &[], listed_below_uid)
+            .unwrap();
+        assert_eq!(
+            store.assign_folder_uids("drafts", &["new"]).unwrap()["new"],
+            2
+        );
+        assert_eq!(
+            store.assign_folder_uids("drafts", &["old"]).unwrap()["old"],
+            3
+        );
     }
 }

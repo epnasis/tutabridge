@@ -77,6 +77,10 @@ impl ImapSession {
         self.idle_tag.is_some()
     }
 
+    pub fn is_authenticated(&self) -> bool {
+        matches!(self.state, State::Authenticated | State::Selected)
+    }
+
     pub fn is_awaiting_auth(&self) -> bool {
         self.auth_tag.is_some()
     }
@@ -1009,6 +1013,7 @@ impl ImapSession {
             "FETCH" => self.cmd_fetch(tag, subargs, true).await,
             "SEARCH" => self.cmd_search(tag, subargs, true).await,
             "STORE" => self.cmd_store(tag, subargs, true).await,
+            "EXPUNGE" => self.cmd_uid_expunge(tag, subargs).await,
             "MOVE" => self.cmd_move(tag, subargs, true).await,
             "COPY" => self.cmd_copy(tag),
             _ => vec![format!("{} BAD Unknown UID subcommand\r\n", tag)],
@@ -1023,14 +1028,42 @@ impl ImapSession {
     }
 
     async fn cmd_expunge(&mut self, tag: &str) -> Vec<String> {
+        self.expunge(tag, "EXPUNGE", None).await
+    }
+
+    /// UID EXPUNGE (RFC 4315, required by the advertised UIDPLUS): only the
+    /// `\Deleted` messages in the set, so a client replacing one draft does
+    /// not expunge another session's deletions.
+    async fn cmd_uid_expunge(&mut self, tag: &str, args: &str) -> Vec<String> {
         if self.state != State::Selected {
             return vec![format!("{} NO No mailbox selected\r\n", tag)];
         }
+        let Some(indices) = self.resolve_sequence_set(args.trim(), true) else {
+            return vec![format!("{tag} BAD UID EXPUNGE needs a UID set\r\n")];
+        };
+        let in_set: std::collections::HashSet<u32> = indices
+            .iter()
+            .filter_map(|&i| self.mails.get(i))
+            .map(|m| m.uid)
+            .collect();
+        self.expunge(tag, "UID EXPUNGE", Some(&in_set)).await
+    }
+
+    async fn expunge(
+        &mut self,
+        tag: &str,
+        cmd: &str,
+        only: Option<&std::collections::HashSet<u32>>,
+    ) -> Vec<String> {
+        if self.state != State::Selected {
+            return vec![format!("{} NO No mailbox selected\r\n", tag)];
+        }
+        let chosen = |m: &CachedMail| m.deleted && only.map_or(true, |set| set.contains(&m.uid));
 
         let deleted_ids: Vec<_> = self
             .mails
             .iter()
-            .filter(|m| m.deleted)
+            .filter(|m| chosen(m))
             .filter_map(|m| m.mail._id.clone())
             .collect();
 
@@ -1044,7 +1077,7 @@ impl ImapSession {
         let mut seq = 1u32;
         let mut i = 0;
         while i < self.mails.len() {
-            if self.mails[i].deleted {
+            if chosen(&self.mails[i]) {
                 responses.push(format!("* {} EXPUNGE\r\n", seq));
                 self.mails.remove(i);
             } else {
@@ -1053,7 +1086,7 @@ impl ImapSession {
             }
         }
 
-        responses.push(format!("{} OK EXPUNGE completed\r\n", tag));
+        responses.push(format!("{tag} OK {cmd} completed\r\n"));
         responses
     }
 
@@ -2586,6 +2619,25 @@ mod tests {
         }
         let resp = session.handle_command("t COPY 1 Trash").await;
         assert!(resp[0].starts_with("t NO [CANNOT]"), "{resp:?}");
+    }
+
+    #[tokio::test]
+    async fn uid_expunge_removes_only_the_named_deleted_messages() {
+        let mails = vec![make_mail("e1", "a", false), make_mail("e2", "b", false)];
+        let backend = Arc::new(MockBackend::with_mails(mails));
+        let (_, mut session) = make_session(backend.clone()).await;
+        session.handle_command("a LOGIN u p").await;
+        session.handle_command("b SELECT INBOX").await;
+        session
+            .handle_command("c STORE 1:2 +FLAGS (\\Deleted)")
+            .await;
+        let resp = session.handle_command("d UID EXPUNGE 2").await;
+        assert_eq!(resp, ["* 2 EXPUNGE\r\n", "d OK UID EXPUNGE completed\r\n"]);
+        let trashed = backend.trashed.lock().unwrap().clone();
+        assert_eq!(trashed.len(), 1);
+        assert_eq!(trashed[0].element_id.to_string(), "e2");
+        let resp = session.handle_command("e UID EXPUNGE x").await;
+        assert!(resp[0].starts_with("e BAD"), "{resp:?}");
     }
 
     #[tokio::test]
