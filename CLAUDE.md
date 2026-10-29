@@ -31,7 +31,71 @@ value cannot smuggle a structural header in. Absent headers are normal
 
 **Renditions are cached** (`<element_id>.eml.enc`, gated by `has_eml`), so
 changing what this function emits only affects mail rendered after the
-change. Mail already in the cache keeps its old headers until re-rendered.
+change — unless `RENDITION_VERSION` in `store.rs` is bumped. The bridge (not
+backup) calls `LocalStore::drop_stale_renditions` at start: on a version
+mismatch every `.eml.enc` is deleted and re-rendered as bodies are fetched
+(prefetch window by the syncer, older mail by on-demand FETCH, which also
+persists — but only when its attachments loaded). Bump it whenever the
+emitted headers change.
+
+### `X-Tutabridge-Authentication` (issue #16)
+
+Every rendition's FIRST header, e.g. `status=hard_fail;
+status-source=tuta-server; encryption-auth=unknown;
+encryption-auth-source=tuta-client-decrypt; v=1`. Guarantee: if present in
+the top-level header block, the bridge wrote it and exactly one copy exists.
+
+- `status` = `MailDetails.authStatus` (what the web client's "could not
+  verify sender" banner reads), NOT `Mail.authStatus`. `unknown` = no details.
+- `encryption-auth` = `Mail.encryptionAuthStatus`, a client-side value.
+- Phishing status is deliberately left out: Tuta clients set it after
+  delivery and a served rendition is immutable, so it would go stale.
+- Enforcement is two layers: no sender text reaches a header line raw
+  (`sanitize_header_line` / `encode_header_value` neutralise every
+  `is_line_break` char — the whole `str.splitlines` set, not just CR/LF),
+  and `prepend_authentication_header` strips every same-named field with the
+  name rule of the IMAP `HEADER.FIELDS` filter (Unicode uppercase).
+  Line breaks are replaced BEFORE base64-encoding a value, since a decoding
+  client would get them back. Sender text containing an RFC 2047
+  encoded-word start (`=?`) is never emitted raw: subject/names are wrapped
+  in our own encoded-word (one decode yields it literally), addresses have
+  it broken up, and passthrough fields carrying one are dropped. No decoder:
+  clients decode more leniently than any check we could write.
+- Every top-level header line is printable ASCII (`is_plain_header_text`):
+  readers disagree on what is a break or trimmable (Latin-1 0x85 in UTF-8
+  `Å`, U+FEFF, control chars), so non-ASCII sender text is base64-encoded
+  (subject/names), turned into `?` (addresses — an RFC 6531 address is shown
+  mangled), or dropped (passthrough fields). Server ids in Message-ID and
+  the boundary go through the same filter. The stripper trims everything
+  but visible ASCII off names. No plain line exceeds 998 octets (a relay
+  may split it): long subject/names are base64'd (no `:` to split into),
+  addresses are cut at 254, From/To/Cc fold before a line passes 900
+  (`address_field`; ordinary mail stays on one line), over-long passthrough
+  fields are dropped. Header-safe addresses come from
+  `header_address_tokens`; `format_address` (search, MCP) keeps the stored
+  address as data.
+- The verdict needs the mail's details, which header-only FETCHes never
+  load. For mail not fetched yet they show `status=unknown` (true, not a
+  guess); a full-body FETCH (`BODY.PEEK[]`) always carries the real verdict.
+
+### IMAP SEARCH: an error, never a false answer
+
+`imap/search.rs` reads a SEARCH exactly or not at all (issue #16): any
+criterion it cannot read — unknown key, malformed set/date/size, missing
+argument, unbalanced parens, literal `{N}`, unterminated quote — parses to
+`SearchKey::Invalid` and the command answers BAD. A fallback ("match all")
+would be a silent wrong answer, and under `NOT` an empty success. Other
+rules:
+- `*` is the largest sequence number / UID (`SearchContext.max_*`).
+- FETCH/STORE/MOVE share the strict `parse_seqset` (BAD when malformed).
+- `KEYWORD` matches label keywords exactly as FETCH FLAGS reports them.
+- Body terms are quoted FTS5 words; an index error answers
+  `NO [UNAVAILABLE]`, a term without alphanumerics `NO [CANNOT]`, a
+  charset other than US-ASCII/UTF-8 `NO [BADCHARSET]`.
+- Not covered: the index matches word prefixes, so a substring in the
+  middle of a CJK run is not found. Accents fold (`gesla` finds "gęślą"),
+  but letters that are not base + accent do not (`zazolc` misses
+  "zażółć": `ł` is its own letter) — checked with SQLite 3.50.4's FTS5.
 
 ### UIDs and UIDVALIDITY
 

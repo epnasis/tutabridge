@@ -221,6 +221,15 @@ impl BridgeHandle {
             self.emit_log("Storage key changed — resetting local cache");
             let _ = local_store.reset();
         }
+        match local_store.drop_stale_renditions() {
+            Ok(0) => {}
+            Ok(n) => self.emit_log(&format!(
+                "Dropped {n} cached messages rendered by an older version; they re-render as bodies are fetched"
+            )),
+            Err(e) => self.emit_log(&format!(
+                "Could not drop stale cached messages ({e}); some may be served without X-Tutabridge-Authentication until the next start retries"
+            )),
+        }
         let local_store = Arc::new(local_store);
         self.emit_log("Local store opened");
 
