@@ -219,7 +219,8 @@ impl LocalStore {
                 unread          INTEGER NOT NULL DEFAULT 1,
                 has_details     INTEGER NOT NULL DEFAULT 0,
                 uid             INTEGER NOT NULL DEFAULT 0,
-                mail_json       TEXT NOT NULL
+                mail_json       TEXT NOT NULL,
+                attachments_pending INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_mails_folder
                 ON mails(folder_id, received_date_ms DESC);
@@ -247,6 +248,17 @@ impl LocalStore {
             );
             INSERT OR REPLACE INTO store_meta(key, value) VALUES ('schema_version', '{SCHEMA_VERSION}');"
         ))?;
+
+        // Added after schema 5; a column, not a schema bump, so upgrading
+        // keeps the metadata (and the UIDVALIDITY clients hold).
+        let has_pending_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('mails') WHERE name = 'attachments_pending'")?
+            .exists([])?;
+        if !has_pending_column {
+            conn.execute_batch(
+                "ALTER TABLE mails ADD COLUMN attachments_pending INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
 
         debug!("LocalStore opened at {}", db_path.display());
 
@@ -572,6 +584,36 @@ impl LocalStore {
         }
 
         Ok(deleted)
+    }
+
+    /// Whether a mail's rendition on disk still lacks attachments the retry
+    /// pass should fetch. Persisted, so a restart does not finalize it
+    /// body-only.
+    pub fn set_attachments_pending(
+        &self,
+        element_id: &str,
+        pending: bool,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE mails SET attachments_pending = ?2 WHERE element_id = ?1",
+            rusqlite::params![element_id, pending as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn attachments_pending_in(
+        &self,
+        folder_id: &str,
+    ) -> Result<std::collections::HashSet<String>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT element_id FROM mails WHERE folder_id = ?1 AND attachments_pending = 1",
+        )?;
+        let ids = stmt
+            .query_map([folder_id], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(ids)
     }
 
     pub fn mark_has_details(&self, element_id: &str) -> Result<(), StoreError> {

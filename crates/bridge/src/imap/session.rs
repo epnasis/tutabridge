@@ -521,12 +521,15 @@ impl ImapSession {
                                 atts.iter().map(|(f, d)| (f, d.as_slice())).collect();
                             let rfc = mail_to_rfc2822(&mail, Some(&details), &refs);
                             // Persist it like a prefetched body, so it survives a
-                            // restart and SEARCH BODY finds it. A rendition still
-                            // waiting for its attachments stays memory-only: once
-                            // on disk, prefetch takes `has_eml` to mean done.
-                            if let (false, Some(eid), Some(ls)) =
-                                (attachments_pending, &elem_id, &self.local_store)
-                            {
+                            // restart and SEARCH BODY finds it. Still waiting for
+                            // attachments, it is persisted too, with the pending
+                            // flag the syncer's retry pass completes it from.
+                            if let (Some(eid), Some(ls)) = (&elem_id, &self.local_store) {
+                                if attachments_pending {
+                                    if let Err(e) = ls.set_attachments_pending(eid, true) {
+                                        warn!("Failed to mark attachments pending {eid}: {e}");
+                                    }
+                                }
                                 if let Err(e) = ls.write_eml(eid, &rfc) {
                                     warn!("Failed to cache eml {eid}: {e}");
                                 } else if let Err(e) = ls.mark_has_details(eid) {
@@ -2693,15 +2696,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn on_demand_body_fetch_with_failed_attachments_is_not_persisted() {
+    async fn on_demand_body_fetch_with_failed_attachments_is_persisted_as_pending() {
         let (resp, _, local_store, store) = on_demand_fetch(true).await;
         assert!(resp.last().unwrap().contains("OK"), "{resp:?}");
-        // Served from memory, but not written: on disk, prefetch would take
-        // it as done and the attachments would never be retried.
-        assert!(!local_store.has_eml("od"));
-        assert!(!local_store.load_folder_metadata("inbox").unwrap()[0].has_details);
-        // Flagged for the syncer's attachment retry pass.
+        // Saved and searchable now; flagged, in memory and on disk, for the
+        // syncer's attachment retry pass — a restart keeps the flag.
+        assert!(local_store.has_eml("od"));
+        assert!(local_store.load_folder_metadata("inbox").unwrap()[0].has_details);
         assert!(store.get_folder("inbox").await[0].attachments_pending);
+        assert!(local_store
+            .attachments_pending_in("inbox")
+            .unwrap()
+            .contains("od"));
+    }
+
+    #[tokio::test]
+    async fn pending_attachments_are_retried_after_a_restart() {
+        let (_, backend, local_store, _) = on_demand_fetch(true).await;
+        *backend.fail_attachments.lock().unwrap() = false;
+        // A restarted bridge loads the cache: the rendition and the flag,
+        // but no details in memory.
+        let store = MailStore::new();
+        crate::sync::load_cached_folder(&store, &local_store, &inbox_folder())
+            .await
+            .unwrap();
+        let restored = store.get_folder("inbox").await;
+        assert!(
+            restored[0].attachments_pending,
+            "the flag survives the restart"
+        );
+        assert!(restored[0].details.is_none());
+        crate::sync::prefetch_details(
+            &store,
+            &local_store,
+            &*backend,
+            &inbox_folder(),
+            0,
+            &mut std::collections::HashMap::new(),
+        )
+        .await;
+        assert!(!store.get_folder("inbox").await[0].attachments_pending);
+        assert!(local_store
+            .attachments_pending_in("inbox")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_transient_failure_gives_up_after_the_attempt_cap() {
+        let (_, backend, local_store, store) = on_demand_fetch(true).await;
+        let mut retries = crate::sync::AttachmentRetries::new();
+        retries.insert(
+            "od".to_string(),
+            crate::sync::AttachmentRetry::long_ago(crate::sync::ATTACHMENT_RETRY_MAX_ATTEMPTS - 1),
+        );
+        crate::sync::prefetch_details(
+            &store,
+            &local_store,
+            &*backend,
+            &inbox_folder(),
+            0,
+            &mut retries,
+        )
+        .await;
+        // Still failing on the last allowed attempt: kept body-only for good.
+        assert!(!store.get_folder("inbox").await[0].attachments_pending);
+        assert!(local_store
+            .attachments_pending_in("inbox")
+            .unwrap()
+            .is_empty());
+        assert!(local_store.has_eml("od"));
     }
 
     #[tokio::test]
@@ -2807,13 +2871,14 @@ mod tests {
         assert!(transient(
             "InternalSdkError: Session key resolution failure: instance missing owner key/group data"
         ));
+        assert!(transient("ServerResponseError: Invalid Software Version"));
         assert!(!transient("ServerResponseError: Not Found"));
     }
 
     #[tokio::test]
     async fn a_retry_that_fails_for_good_keeps_the_body() {
         let (_, backend, local_store, store) = on_demand_fetch(true).await;
-        assert!(!local_store.has_eml("od"), "transient first: memory only");
+        assert!(store.get_folder("inbox").await[0].attachments_pending);
         *backend.attachments_fail_for_good.lock().unwrap() = true;
         crate::sync::prefetch_details(
             &store,
