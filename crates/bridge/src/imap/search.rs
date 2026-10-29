@@ -12,19 +12,37 @@
 //! per-term hit sets to [`matches`] via a [`SearchContext`]. A body term only
 //! matches messages whose body has actually been downloaded and indexed.
 //!
-//! Robustness rule: an unrecognised criterion degrades to a non-restrictive
-//! match (it never *hides* messages). Over-inclusion is the safe failure for
-//! search; silently dropping a matching mail is not.
+//! Robustness rule: a criterion the parser cannot read exactly — unknown,
+//! malformed, missing its argument — is [`SearchKey::Invalid`] and the whole
+//! SEARCH answers BAD. A fallback would be a silent wrong answer: matching
+//! all hides nothing but ignores the criterion, and under `NOT` it becomes
+//! an empty success indistinguishable from "no such mail" (issue #16).
 
 use std::collections::{HashMap, HashSet};
 
-/// One element of an IMAP sequence/UID set, e.g. `1`, `3:9`, or `5:*`.
+/// A number in a sequence/UID set: `*` is the largest one in the mailbox,
+/// known only when matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeqNum {
+    Num(u32),
+    Star,
+}
+
+impl SeqNum {
+    fn resolve(self, max: u32) -> u32 {
+        match self {
+            SeqNum::Num(n) => n,
+            SeqNum::Star => max,
+        }
+    }
+}
+
+/// One element of an IMAP sequence/UID set, e.g. `1`, `3:9`, or `5:*`. Its
+/// ends may come in either order (RFC 3501: `5:2` is `2:5`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SeqRange {
-    start: u32,
-    /// `None` represents `*` (the largest value present). Since any concrete
-    /// value is `<=` the max, an open-ended range is just `value >= start`.
-    end: Option<u32>,
+    first: SeqNum,
+    last: SeqNum,
 }
 
 /// A parsed sequence or UID set (comma-separated [`SeqRange`]s).
@@ -34,17 +52,13 @@ pub struct SeqSet {
 }
 
 impl SeqSet {
-    fn contains(&self, value: u32) -> bool {
-        self.ranges.iter().any(|r| match r.end {
-            None => value >= r.start,
-            Some(end) => {
-                let (lo, hi) = if r.start <= end {
-                    (r.start, end)
-                } else {
-                    (end, r.start)
-                };
-                value >= lo && value <= hi
-            }
+    /// `max` is the largest sequence number or UID in the mailbox, which `*`
+    /// stands for: `*` alone is that one message, and `n:*` with `n` above it
+    /// still includes it.
+    pub(crate) fn contains(&self, value: u32, max: u32) -> bool {
+        self.ranges.iter().any(|r| {
+            let (a, b) = (r.first.resolve(max), r.last.resolve(max));
+            (a.min(b)..=a.max(b)).contains(&value)
         })
     }
 }
@@ -74,8 +88,9 @@ pub enum SearchKey {
     Recent,
     New,
     Old,
-    Keyword,
-    Unkeyword,
+    /// A keyword (Thunderbird tag, i.e. a Tuta label) the mail carries.
+    Keyword(String),
+    Unkeyword(String),
 
     // Header / string predicates (case-insensitive substring).
     Subject(String),
@@ -102,6 +117,12 @@ pub enum SearchKey {
 
     Uid(SeqSet),
     Sequence(SeqSet),
+
+    /// A criterion the client got wrong; the whole SEARCH answers BAD rather
+    /// than an empty success that would read as "no such mail".
+    Invalid(String),
+    /// A `CHARSET` other than [`SUPPORTED_CHARSETS`]: NO [BADCHARSET].
+    BadCharset(String),
 }
 
 /// The slice of a message the matcher needs. Derived fields (From / To / Cc /
@@ -127,6 +148,8 @@ pub struct MsgView<'a> {
     pub unread: bool,
     pub deleted: bool,
     pub size: u64,
+    /// The keywords FETCH FLAGS reports for this mail.
+    pub keywords: Vec<&'a str>,
 }
 
 /// Pre-resolved full-text results for one SEARCH: maps each `BODY`/`TEXT` term
@@ -135,6 +158,9 @@ pub struct MsgView<'a> {
 #[derive(Default)]
 pub struct SearchContext {
     pub body_hits: HashMap<String, HashSet<String>>,
+    /// The values `*` stands for in sequence and UID sets.
+    pub max_seq: u32,
+    pub max_uid: u32,
 }
 
 impl SearchContext {
@@ -143,9 +169,12 @@ impl SearchContext {
     }
 
     fn body_matches(&self, term: &str, element_id: &str) -> bool {
-        self.body_hits
-            .get(term)
-            .is_some_and(|ids| ids.contains(element_id))
+        // RFC 3501: the empty string is in every message.
+        term.is_empty()
+            || self
+                .body_hits
+                .get(term)
+                .is_some_and(|ids| ids.contains(element_id))
     }
 }
 
@@ -223,8 +252,10 @@ pub fn matches(key: &SearchKey, m: &MsgView, ctx: &SearchContext) -> bool {
         SearchKey::Recent => false,
         SearchKey::New => false, // RECENT && UNSEEN — we never flag \Recent
         SearchKey::Old => true,
-        SearchKey::Keyword => false,
-        SearchKey::Unkeyword => true,
+        // Flags compare case-insensitively (RFC 3501), and Thunderbird
+        // lowercases the keywords it sends.
+        SearchKey::Keyword(k) => m.keywords.iter().any(|kw| kw.eq_ignore_ascii_case(k)),
+        SearchKey::Unkeyword(k) => !m.keywords.iter().any(|kw| kw.eq_ignore_ascii_case(k)),
 
         SearchKey::Subject(s) => contains_ci(m.subject, s),
         SearchKey::From(s) => contains_ci(&m.from, s),
@@ -245,8 +276,9 @@ pub fn matches(key: &SearchKey, m: &MsgView, ctx: &SearchContext) -> bool {
         SearchKey::Larger(n) => m.size > *n,
         SearchKey::Smaller(n) => m.size < *n,
 
-        SearchKey::Uid(set) => set.contains(m.uid),
-        SearchKey::Sequence(set) => set.contains(m.seq),
+        SearchKey::Uid(set) => set.contains(m.uid, ctx.max_uid),
+        SearchKey::Invalid(_) | SearchKey::BadCharset(_) => false,
+        SearchKey::Sequence(set) => set.contains(m.seq, ctx.max_seq),
     }
 }
 
@@ -262,6 +294,11 @@ enum Token {
     Atom(String),
     /// A double-quoted string argument (may hold spaces / UTF-8).
     Quoted(String),
+    /// A quoted string the input ended inside.
+    Unterminated,
+    /// An IMAP literal (`{N}` / `{N+}`); its bytes would follow on the
+    /// next line, which the line reader does not join.
+    Literal,
 }
 
 fn tokenize(input: &str) -> Vec<Token> {
@@ -283,6 +320,7 @@ fn tokenize(input: &str) -> Vec<Token> {
             '"' => {
                 chars.next(); // opening quote
                 let mut s = String::new();
+                let mut closed = false;
                 while let Some(ch) = chars.next() {
                     match ch {
                         '\\' => {
@@ -290,11 +328,18 @@ fn tokenize(input: &str) -> Vec<Token> {
                                 s.push(escaped);
                             }
                         }
-                        '"' => break,
+                        '"' => {
+                            closed = true;
+                            break;
+                        }
                         _ => s.push(ch),
                     }
                 }
-                tokens.push(Token::Quoted(s));
+                tokens.push(if closed {
+                    Token::Quoted(s)
+                } else {
+                    Token::Unterminated
+                });
             }
             _ => {
                 let mut s = String::new();
@@ -305,7 +350,11 @@ fn tokenize(input: &str) -> Vec<Token> {
                     s.push(ch);
                     chars.next();
                 }
-                tokens.push(Token::Atom(s));
+                tokens.push(if is_literal_marker(&s) {
+                    Token::Literal
+                } else {
+                    Token::Atom(s)
+                });
             }
         }
     }
@@ -313,11 +362,32 @@ fn tokenize(input: &str) -> Vec<Token> {
 }
 
 /// Parse a full SEARCH argument string into a single composite key.
+///
+/// Anything malformed becomes [`SearchKey::Invalid`] (the session answers
+/// BAD) rather than a fallback: a fallback is a silent wrong answer, and
+/// under `NOT` an empty success.
 pub fn parse(args: &str) -> SearchKey {
     let tokens = tokenize(args);
+    if tokens.contains(&Token::Literal) {
+        return SearchKey::Invalid(
+            "literals are not supported in SEARCH; send the text as a quoted string".to_owned(),
+        );
+    }
+    if tokens.contains(&Token::Unterminated) {
+        return SearchKey::Invalid("unterminated quoted string".to_owned());
+    }
     let mut i = 0;
     let keys = parse_key_list(&tokens, &mut i, false);
+    if keys.is_empty() {
+        return SearchKey::Invalid("SEARCH needs at least one criterion".to_owned());
+    }
     fold_and(keys)
+}
+
+/// Client text quoted for a response line: response text is 7-bit and one
+/// line, so anything else is escaped.
+fn echo(s: &str) -> String {
+    format!("\"{}\"", s.escape_default())
 }
 
 fn fold_and(mut keys: Vec<SearchKey>) -> SearchKey {
@@ -336,19 +406,82 @@ fn parse_key_list(tokens: &[Token], i: &mut usize, in_group: bool) -> Vec<Search
         if tokens[*i] == Token::RParen {
             *i += 1; // consume ')'
             if in_group {
-                break;
+                return keys;
             }
-            continue; // stray ')' at top level — ignore
+            keys.push(SearchKey::Invalid("unbalanced \")\"".to_owned()));
+            continue;
         }
         match parse_key(tokens, i) {
             Some(k) => keys.push(k),
             None => break,
         }
     }
+    if in_group {
+        keys.push(SearchKey::Invalid("unbalanced \"(\"".to_owned()));
+    }
     keys
 }
 
 /// Read the next token as a string argument (atom or quoted), advancing.
+/// `KEYWORD`/`UNKEYWORD` take a flag keyword, which is an atom (RFC 3501):
+/// a missing one, or one with atom-specials (`\Seen` is a system flag, not a
+/// keyword), is a client error.
+fn keyword_key(
+    tokens: &[Token],
+    i: &mut usize,
+    name: &str,
+    ctor: fn(String) -> SearchKey,
+) -> SearchKey {
+    match next_arg(tokens, i) {
+        Some(keyword) if is_flag_keyword(&keyword) => ctor(keyword),
+        Some(other) => SearchKey::Invalid(format!("{name} {} is not a keyword atom", echo(&other))),
+        None => SearchKey::Invalid(format!("{name} needs a keyword")),
+    }
+}
+
+fn is_flag_keyword(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().all(|c| {
+            c.is_ascii_graphic() && !matches!(c, '(' | ')' | '{' | '%' | '*' | '"' | '\\' | ']')
+        })
+}
+
+/// What SEARCH strings are decoded as. The line reader hands us UTF-8, and
+/// US-ASCII is a subset of it.
+pub const SUPPORTED_CHARSETS: [&str; 2] = ["US-ASCII", "UTF-8"];
+
+fn is_literal_marker(atom: &str) -> bool {
+    let Some(inner) = atom.strip_prefix('{').and_then(|a| a.strip_suffix('}')) else {
+        return false;
+    };
+    let digits = inner.strip_suffix('+').unwrap_or(inner);
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+impl SearchKey {
+    /// The unsupported charset the query names, if any.
+    pub fn bad_charset(&self) -> Option<&str> {
+        match self {
+            SearchKey::BadCharset(name) => Some(name),
+            SearchKey::And(keys) => keys.iter().find_map(SearchKey::bad_charset),
+            SearchKey::Or(a, b) => a.bad_charset().or_else(|| b.bad_charset()),
+            SearchKey::Not(k) => k.bad_charset(),
+            _ => None,
+        }
+    }
+
+    /// Why the query is malformed, if any criterion in it is.
+    pub fn invalid_reason(&self) -> Option<&str> {
+        match self {
+            SearchKey::Invalid(reason) => Some(reason),
+            SearchKey::And(keys) => keys.iter().find_map(SearchKey::invalid_reason),
+            SearchKey::Or(a, b) => a.invalid_reason().or_else(|| b.invalid_reason()),
+            SearchKey::Not(k) => k.invalid_reason(),
+            _ => None,
+        }
+    }
+}
+
 fn next_arg(tokens: &[Token], i: &mut usize) -> Option<String> {
     match tokens.get(*i) {
         Some(Token::Atom(s)) | Some(Token::Quoted(s)) => {
@@ -365,11 +498,23 @@ fn parse_key(tokens: &[Token], i: &mut usize) -> Option<SearchKey> {
     *i += 1;
 
     match token {
-        Token::LParen => Some(fold_and(parse_key_list(tokens, i, true))),
+        Token::LParen => {
+            let keys = parse_key_list(tokens, i, true);
+            Some(if keys.is_empty() {
+                SearchKey::Invalid("empty \"()\"".to_owned())
+            } else {
+                fold_and(keys)
+            })
+        }
         Token::RParen => None,
-        // A stray quoted string in key position can't be a criterion; ignore it
-        // non-restrictively.
-        Token::Quoted(_) => Some(SearchKey::All),
+        // Rejected by `parse` before any key is read.
+        Token::Unterminated | Token::Literal => {
+            Some(SearchKey::Invalid("unterminated quoted string".to_owned()))
+        }
+        Token::Quoted(text) => Some(SearchKey::Invalid(format!(
+            "{} is not a search key",
+            echo(&text)
+        ))),
         Token::Atom(atom) => Some(parse_atom_key(&atom, tokens, i)),
     }
 }
@@ -393,88 +538,115 @@ fn parse_atom_key(atom: &str, tokens: &[Token], i: &mut usize) -> SearchKey {
         "OLD" => SearchKey::Old,
 
         "OR" => {
-            let a = parse_key(tokens, i).unwrap_or(SearchKey::All);
-            let b = parse_key(tokens, i).unwrap_or(SearchKey::All);
+            let missing = || SearchKey::Invalid("OR needs two criteria".to_owned());
+            let a = parse_key(tokens, i).unwrap_or_else(missing);
+            let b = parse_key(tokens, i).unwrap_or_else(missing);
             SearchKey::Or(Box::new(a), Box::new(b))
         }
         "NOT" => {
-            let a = parse_key(tokens, i).unwrap_or(SearchKey::All);
+            let a = parse_key(tokens, i)
+                .unwrap_or_else(|| SearchKey::Invalid("NOT needs a criterion".to_owned()));
             SearchKey::Not(Box::new(a))
         }
 
         // `CHARSET <name>` is a prefix, not a criterion — skip the name and
         // parse the key that follows.
-        "CHARSET" => {
-            let _ = next_arg(tokens, i);
-            parse_key(tokens, i).unwrap_or(SearchKey::All)
-        }
+        "CHARSET" => match next_arg(tokens, i) {
+            Some(name)
+                if SUPPORTED_CHARSETS
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(&name)) =>
+            {
+                parse_key(tokens, i).unwrap_or_else(|| {
+                    SearchKey::Invalid("CHARSET needs a criterion after it".to_owned())
+                })
+            }
+            Some(name) => SearchKey::BadCharset(name),
+            None => SearchKey::Invalid("CHARSET needs a name".to_owned()),
+        },
 
-        "SUBJECT" => str_key(tokens, i, SearchKey::Subject),
-        "FROM" => str_key(tokens, i, SearchKey::From),
-        "TO" => str_key(tokens, i, SearchKey::To),
-        "CC" => str_key(tokens, i, SearchKey::Cc),
-        "BCC" => str_key(tokens, i, SearchKey::Bcc),
-        "BODY" => str_key(tokens, i, SearchKey::Body),
-        "TEXT" => str_key(tokens, i, SearchKey::Text),
-        "KEYWORD" => {
-            let _ = next_arg(tokens, i);
-            SearchKey::Keyword
-        }
-        "UNKEYWORD" => {
-            let _ = next_arg(tokens, i);
-            SearchKey::Unkeyword
-        }
-        "HEADER" => {
-            let name = next_arg(tokens, i).unwrap_or_default();
-            let value = next_arg(tokens, i).unwrap_or_default();
-            SearchKey::Header(name, value)
-        }
+        "SUBJECT" => str_key(tokens, i, "SUBJECT", SearchKey::Subject),
+        "FROM" => str_key(tokens, i, "FROM", SearchKey::From),
+        "TO" => str_key(tokens, i, "TO", SearchKey::To),
+        "CC" => str_key(tokens, i, "CC", SearchKey::Cc),
+        "BCC" => str_key(tokens, i, "BCC", SearchKey::Bcc),
+        "BODY" => str_key(tokens, i, "BODY", SearchKey::Body),
+        "TEXT" => str_key(tokens, i, "TEXT", SearchKey::Text),
+        "KEYWORD" => keyword_key(tokens, i, "KEYWORD", SearchKey::Keyword),
+        "UNKEYWORD" => keyword_key(tokens, i, "UNKEYWORD", SearchKey::Unkeyword),
+        "HEADER" => match (next_arg(tokens, i), next_arg(tokens, i)) {
+            (Some(name), Some(value)) => SearchKey::Header(name, value),
+            _ => SearchKey::Invalid("HEADER needs a field name and a string".to_owned()),
+        },
 
-        "BEFORE" => date_key(tokens, i, SearchKey::Before),
-        "ON" => date_key(tokens, i, SearchKey::On),
-        "SINCE" => date_key(tokens, i, SearchKey::Since),
-        "SENTBEFORE" => date_key(tokens, i, SearchKey::SentBefore),
-        "SENTON" => date_key(tokens, i, SearchKey::SentOn),
-        "SENTSINCE" => date_key(tokens, i, SearchKey::SentSince),
+        "BEFORE" => date_key(tokens, i, "BEFORE", SearchKey::Before),
+        "ON" => date_key(tokens, i, "ON", SearchKey::On),
+        "SINCE" => date_key(tokens, i, "SINCE", SearchKey::Since),
+        "SENTBEFORE" => date_key(tokens, i, "SENTBEFORE", SearchKey::SentBefore),
+        "SENTON" => date_key(tokens, i, "SENTON", SearchKey::SentOn),
+        "SENTSINCE" => date_key(tokens, i, "SENTSINCE", SearchKey::SentSince),
 
-        "LARGER" => size_key(tokens, i, SearchKey::Larger),
-        "SMALLER" => size_key(tokens, i, SearchKey::Smaller),
+        "LARGER" => size_key(tokens, i, "LARGER", SearchKey::Larger),
+        "SMALLER" => size_key(tokens, i, "SMALLER", SearchKey::Smaller),
 
-        "UID" => {
-            let set = next_arg(tokens, i)
-                .map(|s| parse_seqset(&s))
-                .unwrap_or_default();
-            SearchKey::Uid(set)
-        }
+        "UID" => match next_arg(tokens, i) {
+            Some(text) => match parse_seqset(&text) {
+                Some(set) => SearchKey::Uid(set),
+                None => SearchKey::Invalid(format!("UID {} is not a set", echo(&text))),
+            },
+            None => SearchKey::Invalid("UID needs a set".to_owned()),
+        },
 
-        // Not a recognised keyword: a bare sequence set, or something we don't
-        // model. A seq-set becomes a Sequence predicate; anything else degrades
-        // to a non-restrictive match so we never hide results.
+        // Not a recognised keyword: a bare sequence set is a criterion of its
+        // own; anything else is a key we do not know.
         _ => {
             if is_seqset(atom) {
-                SearchKey::Sequence(parse_seqset(atom))
+                match parse_seqset(atom) {
+                    Some(set) => SearchKey::Sequence(set),
+                    None => SearchKey::Invalid(format!("{} is not a set", echo(atom))),
+                }
             } else {
-                SearchKey::All
+                SearchKey::Invalid(format!("unknown search key {}", echo(atom)))
             }
         }
     }
 }
 
-fn str_key(tokens: &[Token], i: &mut usize, ctor: fn(String) -> SearchKey) -> SearchKey {
-    ctor(next_arg(tokens, i).unwrap_or_default())
-}
-
-fn date_key(tokens: &[Token], i: &mut usize, ctor: fn(i64) -> SearchKey) -> SearchKey {
-    match next_arg(tokens, i).and_then(|s| parse_imap_date(&s)) {
-        Some(day) => ctor(day),
-        None => SearchKey::All,
+fn str_key(
+    tokens: &[Token],
+    i: &mut usize,
+    name: &str,
+    ctor: fn(String) -> SearchKey,
+) -> SearchKey {
+    match next_arg(tokens, i) {
+        Some(text) => ctor(text),
+        None => SearchKey::Invalid(format!("{name} needs a string")),
     }
 }
 
-fn size_key(tokens: &[Token], i: &mut usize, ctor: fn(u64) -> SearchKey) -> SearchKey {
-    match next_arg(tokens, i).and_then(|s| s.parse::<u64>().ok()) {
-        Some(n) => ctor(n),
-        None => SearchKey::All,
+fn date_key(tokens: &[Token], i: &mut usize, name: &str, ctor: fn(i64) -> SearchKey) -> SearchKey {
+    match next_arg(tokens, i) {
+        Some(text) => match parse_imap_date(&text) {
+            Some(day) => ctor(day),
+            None => SearchKey::Invalid(format!(
+                "{name} {} is not a date like 1-Feb-2024",
+                echo(&text)
+            )),
+        },
+        None => SearchKey::Invalid(format!("{name} needs a date")),
+    }
+}
+
+fn size_key(tokens: &[Token], i: &mut usize, name: &str, ctor: fn(u64) -> SearchKey) -> SearchKey {
+    match next_arg(tokens, i) {
+        Some(text) if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) => {
+            match text.parse::<u64>() {
+                Ok(n) => ctor(n),
+                Err(_) => SearchKey::Invalid(format!("{name} {} is too large", echo(&text))),
+            }
+        }
+        Some(text) => SearchKey::Invalid(format!("{name} {} is not a size", echo(&text))),
+        None => SearchKey::Invalid(format!("{name} needs a size")),
     }
 }
 
@@ -484,39 +656,49 @@ fn is_seqset(s: &str) -> bool {
             .all(|c| c.is_ascii_digit() || c == ':' || c == ',' || c == '*')
 }
 
-fn parse_seqset(s: &str) -> SeqSet {
-    let mut ranges = Vec::new();
-    for part in s.split(',') {
-        if part.is_empty() {
-            continue;
+/// RFC 3501 `sequence-set`: comma-separated `seq-number` or
+/// `seq-number:seq-number`, where a `seq-number` is a non-zero number or `*`.
+/// `None` for anything else.
+pub(crate) fn parse_seqset(s: &str) -> Option<SeqSet> {
+    let seq_number = |text: &str| -> Option<SeqNum> {
+        if text == "*" {
+            return Some(SeqNum::Star);
         }
-        if let Some((a, b)) = part.split_once(':') {
-            let start = if a == "*" { 0 } else { a.parse().unwrap_or(0) };
-            let end = if b == "*" { None } else { b.parse().ok() };
-            ranges.push(SeqRange { start, end });
-        } else if part == "*" {
-            ranges.push(SeqRange {
-                start: 0,
-                end: None,
-            });
-        } else if let Ok(n) = part.parse::<u32>() {
-            ranges.push(SeqRange {
-                start: n,
-                end: Some(n),
-            });
+        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
         }
-    }
-    SeqSet { ranges }
+        text.parse().ok().filter(|&n| n != 0).map(SeqNum::Num)
+    };
+    let ranges = s
+        .split(',')
+        .map(|part| {
+            let (first, last) = part.split_once(':').unwrap_or((part, part));
+            Some(SeqRange {
+                first: seq_number(first)?,
+                last: seq_number(last)?,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(SeqSet { ranges })
 }
 
 /// Parse an IMAP date (`dd-Mon-yyyy`, e.g. `1-Feb-2020`) into a day number.
 fn parse_imap_date(s: &str) -> Option<i64> {
+    // RFC 3501: date-day = 1*2DIGIT, date-year = 4DIGIT. A lenient reading
+    // turns `1-Jan-24` into the year 24 or `31-Feb` into March: a silent
+    // wrong answer rather than an error.
+    let digits = |text: &str, lengths: std::ops::RangeInclusive<usize>| {
+        lengths.contains(&text.len()) && text.bytes().all(|b| b.is_ascii_digit())
+    };
     let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 3 {
+    let [day, month, year] = parts[..] else {
+        return None;
+    };
+    if !digits(day, 1..=2) || !digits(year, 4..=4) {
         return None;
     }
-    let day: i64 = parts[0].parse().ok()?;
-    let month = match parts[1].to_lowercase().as_str() {
+    let (day, year): (i64, i64) = (day.parse().ok()?, year.parse().ok()?);
+    let month = match month.to_lowercase().as_str() {
         "jan" => 1,
         "feb" => 2,
         "mar" => 3,
@@ -531,7 +713,16 @@ fn parse_imap_date(s: &str) -> Option<i64> {
         "dec" => 12,
         _ => return None,
     };
-    let year: i64 = parts[2].parse().ok()?;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if !(1..=days_in_month).contains(&day) {
+        return None;
+    }
     Some(days_from_civil(year, month, day))
 }
 
@@ -579,7 +770,38 @@ mod tests {
             unread: true,
             deleted: false,
             size: 5000,
+            keywords: vec!["Work", "$label1"],
         }
+    }
+
+    #[test]
+    fn malformed_keyword_criteria_are_invalid_not_empty() {
+        for query in [
+            "KEYWORD",
+            "KEYWORD \\Seen",
+            "KEYWORD (SEEN)",
+            "(KEYWORD) SEEN",
+            "NOT UNKEYWORD",
+            "OR SEEN KEYWORD a*b",
+        ] {
+            assert!(parse(query).invalid_reason().is_some(), "{query}");
+        }
+        for query in ["KEYWORD work", "KEYWORD $label1", "UNKEYWORD \"work\""] {
+            assert!(parse(query).invalid_reason().is_none(), "{query}");
+        }
+    }
+
+    #[test]
+    fn keyword_matches_case_insensitively() {
+        let m = view();
+        let ctx = SearchContext::default();
+        assert!(matches(&parse("KEYWORD work"), &m, &ctx));
+        assert!(matches(&parse("KEYWORD $Label1"), &m, &ctx));
+        assert!(!matches(&parse("KEYWORD Home"), &m, &ctx));
+        assert!(!matches(&parse("UNKEYWORD WORK"), &m, &ctx));
+        assert!(matches(&parse("UNKEYWORD Home"), &m, &ctx));
+        // The atom is consumed: the next key still applies.
+        assert!(!matches(&parse("KEYWORD work SEEN"), &m, &ctx));
     }
 
     /// A context where the given terms all hit our test message ("mail1").
@@ -588,7 +810,10 @@ mod tests {
         for t in terms {
             body_hits.insert((*t).to_string(), HashSet::from(["mail1".to_string()]));
         }
-        SearchContext { body_hits }
+        SearchContext {
+            body_hits,
+            ..Default::default()
+        }
     }
 
     fn no_ctx() -> SearchContext {
@@ -620,8 +845,9 @@ mod tests {
     // --- parser ---
 
     #[test]
-    fn parse_all_when_empty() {
-        assert_eq!(parse(""), SearchKey::All);
+    fn parse_requires_a_criterion() {
+        // RFC 3501: SEARCH takes at least one key.
+        assert!(parse("").invalid_reason().is_some());
         assert_eq!(parse("ALL"), SearchKey::All);
     }
 
@@ -683,39 +909,139 @@ mod tests {
     }
 
     #[test]
-    fn parse_bad_date_degrades_to_all() {
-        assert_eq!(parse("SINCE not-a-date"), SearchKey::All);
+    fn parse_bad_date_is_invalid() {
+        assert!(parse("SINCE not-a-date").invalid_reason().is_some());
     }
 
     #[test]
     fn parse_seqset_and_uid() {
-        assert_eq!(parse("1:5"), SearchKey::Sequence(parse_seqset("1:5")));
-        assert_eq!(parse("UID 3:*"), SearchKey::Uid(parse_seqset("3:*")));
+        assert_eq!(
+            parse("1:5"),
+            SearchKey::Sequence(parse_seqset("1:5").unwrap())
+        );
+        assert_eq!(
+            parse("UID 3:*"),
+            SearchKey::Uid(parse_seqset("3:*").unwrap())
+        );
     }
 
     #[test]
-    fn parse_unknown_key_is_non_restrictive() {
-        assert_eq!(parse("XFOOBAR"), SearchKey::All);
+    fn parse_unknown_key_is_invalid() {
+        // Matching all would be a silent wrong answer, and under NOT an
+        // empty success (issue #16).
+        assert!(parse("XFOOBAR").invalid_reason().is_some());
+    }
+
+    #[test]
+    fn every_malformed_criterion_is_invalid_even_under_not() {
+        for query in [
+            "NOT FOOBAR",
+            "NOT BEFORE 99-Foo-2020",
+            "NOT SMALLER abc",
+            "LARGER",
+            "UID abc",
+            "UID",
+            "HEADER",
+            "HEADER Subject",
+            "NOT SUBJECT",
+            "NOT \"x\"",
+            "OR SEEN",
+            "NOT",
+            "CHARSET",
+            "CHARSET UTF-8",
+            "(SEEN",
+            "SEEN)",
+            "()",
+            "KEYWORD work FOOBAR",
+        ] {
+            assert!(parse(query).invalid_reason().is_some(), "{query}");
+        }
+        for query in [
+            "SUBJECT \"\"",
+            "HEADER Message-ID \"\"",
+            "CHARSET UTF-8 SUBJECT x",
+            "OR (SEEN) NOT DELETED",
+            "1:5 UID 3:*",
+        ] {
+            assert!(parse(query).invalid_reason().is_none(), "{query}");
+        }
+    }
+
+    #[test]
+    fn invalid_reasons_are_one_7_bit_line() {
+        let reason = parse("KEYWORD \"za\u{17c}\r\nx\"")
+            .invalid_reason()
+            .unwrap()
+            .to_owned();
+        assert!(
+            reason.is_ascii() && !reason.contains(['\r', '\n']),
+            "{reason}"
+        );
     }
 
     // --- seqset ---
 
     #[test]
     fn seqset_membership() {
-        let s = parse_seqset("1,3,5:9");
-        assert!(s.contains(1));
-        assert!(!s.contains(2));
-        assert!(s.contains(3));
-        assert!(s.contains(7));
-        assert!(!s.contains(10));
+        let s = parse_seqset("1,3,5:9").unwrap();
+        assert!(s.contains(1, 20));
+        assert!(!s.contains(2, 20));
+        assert!(s.contains(3, 20));
+        assert!(s.contains(7, 20));
+        assert!(!s.contains(10, 20));
+        // Ends in either order.
+        assert!(parse_seqset("9:5").unwrap().contains(7, 20));
     }
 
     #[test]
-    fn seqset_open_ended_star() {
-        let s = parse_seqset("100:*");
-        assert!(!s.contains(99));
-        assert!(s.contains(100));
-        assert!(s.contains(999_999));
+    fn seqset_star_is_the_largest_value() {
+        let open = parse_seqset("100:*").unwrap();
+        assert!(!open.contains(99, 500));
+        assert!(open.contains(100, 500));
+        assert!(open.contains(500, 500));
+        // `*` alone is that one message, not every one.
+        let star = parse_seqset("*").unwrap();
+        assert!(star.contains(500, 500));
+        assert!(!star.contains(1, 500));
+        // `n:*` above the largest still includes the largest (RFC 3501).
+        assert!(parse_seqset("900:*").unwrap().contains(500, 500));
+    }
+
+    #[test]
+    fn malformed_sets_dates_and_sizes_are_invalid() {
+        for set in [":", "1:2:3", ",", "1,", "0", "1:0", "a", "1:a"] {
+            assert!(parse_seqset(set).is_none(), "{set}");
+        }
+        for query in [
+            ":",
+            "UID 0",
+            "UID ,",
+            "SINCE 1-Jan-24",
+            "SINCE 99-Jan-2024",
+            "SINCE 31-Feb-2024",
+            "SINCE 29-Feb-2023",
+            "SINCE +1-Jan-2024",
+            "LARGER +5",
+            "SUBJECT \"unterminated",
+        ] {
+            assert!(parse(query).invalid_reason().is_some(), "{query}");
+        }
+        for (query, reason) in [
+            ("SUBJECT {6}", "literals"),
+            ("BODY {3+}", "literals"),
+            ("SUBJECT \"open", "unterminated"),
+        ] {
+            let parsed = parse(query);
+            assert!(parsed.invalid_reason().unwrap().contains(reason), "{query}");
+        }
+        assert_eq!(
+            parse("CHARSET ISO-8859-2 SUBJECT x").bad_charset(),
+            Some("ISO-8859-2")
+        );
+        assert!(parse("CHARSET utf-8 SUBJECT x").bad_charset().is_none());
+        for query in ["SINCE 29-Feb-2024", "SINCE 01-Jan-2024", "SINCE 1-jan-2024"] {
+            assert!(parse(query).invalid_reason().is_none(), "{query}");
+        }
     }
 
     // --- matcher ---
@@ -841,9 +1167,21 @@ mod tests {
     fn match_uid_and_seq() {
         let v = view(); // seq 1, uid 10
         let c = no_ctx();
-        assert!(matches(&SearchKey::Uid(parse_seqset("5:15")), &v, &c));
-        assert!(!matches(&SearchKey::Uid(parse_seqset("1:5")), &v, &c));
-        assert!(matches(&SearchKey::Sequence(parse_seqset("1")), &v, &c));
+        assert!(matches(
+            &SearchKey::Uid(parse_seqset("5:15").unwrap()),
+            &v,
+            &c
+        ));
+        assert!(!matches(
+            &SearchKey::Uid(parse_seqset("1:5").unwrap()),
+            &v,
+            &c
+        ));
+        assert!(matches(
+            &SearchKey::Sequence(parse_seqset("1").unwrap()),
+            &v,
+            &c
+        ));
     }
 
     #[test]

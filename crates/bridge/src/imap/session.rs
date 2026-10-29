@@ -224,7 +224,7 @@ impl ImapSession {
             "UID" => self.cmd_uid(&tag, &args).await,
             "CLOSE" => self.cmd_close(&tag),
             "EXPUNGE" => self.cmd_expunge(&tag).await,
-            "SEARCH" => self.cmd_search(&tag, &args, false),
+            "SEARCH" => self.cmd_search(&tag, &args, false).await,
             "STORE" => self.cmd_store(&tag, &args, false).await,
             "MOVE" => self.cmd_move(&tag, &args, false).await,
             "COPY" => self.cmd_copy(&tag),
@@ -392,7 +392,9 @@ impl ImapSession {
         }
 
         let (seq_set, items) = parse_fetch_args(args);
-        let indices = self.resolve_sequence_set(&seq_set, uid_mode);
+        let Some(indices) = self.resolve_sequence_set(&seq_set, uid_mode) else {
+            return vec![format!("{tag} BAD invalid sequence set\r\n")];
+        };
         // One registry snapshot per FETCH command: label keywords in the
         // FLAGS items stay consistent across the whole response.
         let labels = self.store.label_registry().await;
@@ -530,34 +532,44 @@ impl ImapSession {
         responses
     }
 
-    fn cmd_search(&self, tag: &str, args: &str, uid_mode: bool) -> Vec<String> {
+    async fn cmd_search(&self, tag: &str, args: &str, uid_mode: bool) -> Vec<String> {
         if self.state != State::Selected {
             return vec![format!("{} NO No mailbox selected\r\n", tag)];
         }
 
         let query = search::parse(args);
-        let ctx = self.resolve_body_search(&query);
+        if let Some(reason) = query.invalid_reason() {
+            return vec![format!("{tag} BAD {reason}\r\n")];
+        }
+        if query.bad_charset().is_some() {
+            return vec![format!(
+                "{tag} NO [BADCHARSET ({})] charset not supported\r\n",
+                search::SUPPORTED_CHARSETS.join(" ")
+            )];
+        }
+        let ctx = match self.resolve_body_search(&query) {
+            Ok(ctx) => ctx,
+            Err(reason) => return vec![format!("{tag} NO {reason}\r\n")],
+        };
+        let labels = self.store.label_registry().await;
 
         let ids: Vec<u32> = self
             .mails
             .iter()
             .enumerate()
             .filter(|(i, cached)| {
-                let view = Self::build_search_view(*i, cached);
+                let view = Self::build_search_view(*i, cached, &labels);
                 search::matches(&query, &view, &ctx)
             })
             .map(|(i, cached)| if uid_mode { cached.uid } else { (i + 1) as u32 })
             .collect();
 
-        let id_str = ids
-            .iter()
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>()
-            .join(" ");
+        // `"SEARCH" *(SP nz-number)`: no trailing space when nothing matched.
+        let id_str: String = ids.iter().map(|id| format!(" {id}")).collect();
 
         let cmd = if uid_mode { "UID SEARCH" } else { "SEARCH" };
         vec![
-            format!("* SEARCH {}\r\n", id_str),
+            format!("* SEARCH{}\r\n", id_str),
             format!("{} OK {} completed\r\n", tag, cmd),
         ]
     }
@@ -565,7 +577,11 @@ impl ImapSession {
     /// Project a cached message onto the fields IMAP SEARCH compares. Derived
     /// strings (From / To / Cc / Bcc / headers) are owned by the [`MsgView`];
     /// the cheap ones (subject, body) borrow straight from `cached`.
-    fn build_search_view(idx: usize, cached: &CachedMail) -> MsgView<'_> {
+    fn build_search_view<'a>(
+        idx: usize,
+        cached: &'a CachedMail,
+        labels: &'a LabelRegistry,
+    ) -> MsgView<'a> {
         let headers = cached
             .rfc2822
             .as_deref()
@@ -620,26 +636,55 @@ impl ImapSession {
             unread: cached.mail.unread,
             deleted: cached.deleted,
             size: cached.rfc2822.as_ref().map(|r| r.len() as u64).unwrap_or(0),
+            // Same resolution as FETCH FLAGS: only label ids are in the
+            // registry, so the folder entry of `Mail.sets` drops out.
+            keywords: cached
+                .mail
+                .sets
+                .iter()
+                .filter_map(|set| labels.keyword_for_label(set.element_id.0.as_str()))
+                .collect(),
         }
     }
 
-    /// Resolve the `BODY`/`TEXT` terms of a query against the full-text index,
-    /// once per distinct term. With no local store (unit tests) the context is
-    /// empty, so body terms match nothing.
-    fn resolve_body_search(&self, query: &search::SearchKey) -> search::SearchContext {
+    /// Resolve the `BODY`/`TEXT` terms against the full-text index, once per
+    /// distinct term. An index failure, or a term with no alphanumeric
+    /// character (`char::is_alphanumeric`), is an error: "no hits" would be an
+    /// empty success that is not true. The index's tokenizer drops a few more
+    /// characters than that test (some combining marks, superscripts), so a
+    /// term made only of those still answers empty. With no local store (unit
+    /// tests) body terms match nothing.
+    fn resolve_body_search(
+        &self,
+        query: &search::SearchKey,
+    ) -> Result<search::SearchContext, String> {
         let mut ctx = search::SearchContext::empty();
+        ctx.max_seq = self.mails.len() as u32;
+        ctx.max_uid = self.mails.iter().map(|m| m.uid).max().unwrap_or(0);
         let Some(local_store) = &self.local_store else {
-            return ctx;
+            return Ok(ctx);
         };
         for term in search::collect_body_terms(query) {
+            if term.is_empty() {
+                continue; // matches every message; see `body_matches`
+            }
+            if crate::store::fts_match_expr(&term).is_empty() {
+                return Err(format!(
+                    "[CANNOT] body search needs letters or digits, not \"{}\"",
+                    term.escape_default()
+                ));
+            }
             match local_store.search_body(&term) {
                 Ok(ids) => {
                     ctx.body_hits.insert(term, ids.into_iter().collect());
                 }
-                Err(e) => log::warn!("FTS body search failed for {term:?}: {e}"),
+                Err(e) => {
+                    log::warn!("FTS body search failed for {term:?}: {e}");
+                    return Err("[UNAVAILABLE] body search failed (see the bridge log)".to_owned());
+                }
             }
         }
-        ctx
+        Ok(ctx)
     }
 
     async fn cmd_store(&mut self, tag: &str, args: &str, uid_mode: bool) -> Vec<String> {
@@ -651,7 +696,9 @@ impl ImapSession {
         let Some(store_args) = parse_store_args(args) else {
             return vec![format!("{} BAD Invalid STORE arguments\r\n", tag)];
         };
-        let indices = self.resolve_sequence_set(&store_args.seq_set, uid_mode);
+        let Some(indices) = self.resolve_sequence_set(&store_args.seq_set, uid_mode) else {
+            return vec![format!("{tag} BAD invalid sequence set\r\n")];
+        };
         let mut labels = self.store.label_registry().await;
 
         // Bucket the flag list: the system flags Tuta can express, keywords
@@ -874,7 +921,7 @@ impl ImapSession {
 
         match subcmd.as_str() {
             "FETCH" => self.cmd_fetch(tag, subargs, true).await,
-            "SEARCH" => self.cmd_search(tag, subargs, true),
+            "SEARCH" => self.cmd_search(tag, subargs, true).await,
             "STORE" => self.cmd_store(tag, subargs, true).await,
             "MOVE" => self.cmd_move(tag, subargs, true).await,
             "COPY" => self.cmd_copy(tag),
@@ -941,7 +988,9 @@ impl ImapSession {
             None => return vec![format!("{} NO [TRYCREATE] Mailbox does not exist\r\n", tag)],
         };
 
-        let indices = self.resolve_sequence_set(seq_set, uid_mode);
+        let Some(indices) = self.resolve_sequence_set(seq_set, uid_mode) else {
+            return vec![format!("{tag} BAD invalid sequence set\r\n")];
+        };
         let mail_ids: Vec<_> = indices
             .iter()
             .filter_map(|&i| self.mails.get(i))
@@ -1056,45 +1105,27 @@ impl ImapSession {
         Ok(())
     }
 
-    fn resolve_sequence_set(&self, seq_set: &str, uid_mode: bool) -> Vec<usize> {
+    /// Indices of the messages a sequence set (or UID set) names, or `None`
+    /// when it is not RFC 3501 grammar. Membership is tested per message, so
+    /// `1:4294967295` costs one pass over the mailbox, not four billion.
+    fn resolve_sequence_set(&self, seq_set: &str, uid_mode: bool) -> Option<Vec<usize>> {
+        let set = search::parse_seqset(seq_set.trim())?;
         let max = if uid_mode {
             self.mails.iter().map(|m| m.uid).max().unwrap_or(0)
         } else {
             self.mails.len() as u32
         };
-
-        let mut result = Vec::new();
-        for part in seq_set.split(',') {
-            let part = part.trim();
-            if let Some((start, end)) = part.split_once(':') {
-                let s = parse_seq_num(start, max);
-                let e = parse_seq_num(end, max);
-                let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
-                for n in lo..=hi {
-                    if let Some(idx) = self.seq_to_index(n, uid_mode) {
-                        result.push(idx);
-                    }
-                }
-            } else {
-                let n = parse_seq_num(part, max);
-                if let Some(idx) = self.seq_to_index(n, uid_mode) {
-                    result.push(idx);
-                }
-            }
-        }
-        result.sort();
-        result.dedup();
-        result
-    }
-
-    fn seq_to_index(&self, num: u32, uid_mode: bool) -> Option<usize> {
-        if uid_mode {
-            self.mails.iter().position(|m| m.uid == num)
-        } else if num >= 1 && (num as usize) <= self.mails.len() {
-            Some((num - 1) as usize)
-        } else {
-            None
-        }
+        Some(
+            self.mails
+                .iter()
+                .enumerate()
+                .filter(|(i, m)| {
+                    let number = if uid_mode { m.uid } else { (*i + 1) as u32 };
+                    set.contains(number, max)
+                })
+                .map(|(i, _)| i)
+                .collect(),
+        )
     }
 }
 
@@ -1332,24 +1363,13 @@ fn format_envelope_addr(addr: &tutasdk::entities::generated::tutanota::MailAddre
     )
 }
 
-fn parse_seq_num(s: &str, max: u32) -> u32 {
-    if s == "*" {
-        max
-    } else {
-        s.parse::<u32>().unwrap_or(0)
-    }
-}
-
+/// The sequence set is the first word; a set never holds a space or a `(`,
+/// while a single unparenthesised item can (`BODY.PEEK[HEADER.FIELDS (FROM)]`).
 fn parse_fetch_args(args: &str) -> (String, String) {
-    if let Some(paren_start) = args.find('(') {
-        let seq = args[..paren_start].trim().to_string();
-        let items = args[paren_start..].trim().to_string();
-        (seq, items)
-    } else {
-        let parts: Vec<&str> = args.splitn(2, ' ').collect();
-        let seq = parts.first().unwrap_or(&"").to_string();
-        let items = parts.get(1).unwrap_or(&"").to_string();
-        (seq, items)
+    let args = args.trim();
+    match args.split_once(|c: char| c == ' ' || c == '(') {
+        Some((seq, _)) => (seq.to_string(), args[seq.len()..].trim().to_string()),
+        None => (args.to_string(), String::new()),
     }
 }
 
@@ -1722,6 +1742,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_fetch_args_single_item_with_brackets() {
+        let (seq, items) = parse_fetch_args("1 BODY.PEEK[HEADER.FIELDS (FROM)]");
+        assert_eq!(seq, "1");
+        assert_eq!(items, "BODY.PEEK[HEADER.FIELDS (FROM)]");
+        let (seq, items) = parse_fetch_args("1:*(FLAGS)");
+        assert_eq!((seq.as_str(), items.as_str()), ("1:*", "(FLAGS)"));
+    }
+
+    #[test]
     fn test_parse_fetch_args_without_parens() {
         let (seq, items) = parse_fetch_args("1 FLAGS");
         assert_eq!(seq, "1");
@@ -1744,28 +1773,6 @@ mod tests {
         assert_eq!(a.op, StoreOp::Add);
         assert!(!a.silent);
         assert_eq!(a.flags, vec!["\\Seen"]);
-    }
-
-    // --- parse_seq_num ---
-
-    #[test]
-    fn test_parse_seq_num_number() {
-        assert_eq!(parse_seq_num("42", 100), 42);
-    }
-
-    #[test]
-    fn test_parse_seq_num_star() {
-        assert_eq!(parse_seq_num("*", 100), 100);
-    }
-
-    #[test]
-    fn test_parse_seq_num_invalid() {
-        assert_eq!(parse_seq_num("abc", 100), 0);
-    }
-
-    #[test]
-    fn test_parse_seq_num_zero() {
-        assert_eq!(parse_seq_num("0", 100), 0);
     }
 
     // --- needs_body ---
@@ -1982,18 +1989,6 @@ mod tests {
         let (seq, items) = parse_fetch_args("1:* (FLAGS)");
         assert_eq!(seq, "1:*");
         assert_eq!(items, "(FLAGS)");
-    }
-
-    // --- parse_seq_num: large numbers ---
-
-    #[test]
-    fn test_parse_seq_num_large_number() {
-        assert_eq!(parse_seq_num("999999", 100), 999999);
-    }
-
-    #[test]
-    fn test_parse_seq_num_negative() {
-        assert_eq!(parse_seq_num("-1", 100), 0);
     }
 
     // --- build_envelope: subject with quotes ---
@@ -2490,6 +2485,86 @@ mod tests {
             .sets
             .iter()
             .any(|s| s.element_id.to_string() == "l1"));
+    }
+
+    #[tokio::test]
+    async fn malformed_sets_and_unsearchable_terms_are_errors_not_empty() {
+        use crypto_primitives::aes::Aes256Key;
+        use crypto_primitives::key::GenericAesKey;
+        use crypto_primitives::randomizer_facade::RandomizerFacade;
+
+        let tmp = std::env::temp_dir().join(format!("tutabridge_test_{}", rand::random::<u64>()));
+        let key = GenericAesKey::Aes256(Aes256Key::generate(&RandomizerFacade::from_core(
+            rand_core::OsRng,
+        )));
+        let local_store =
+            Arc::new(LocalStore::open(&tmp.join("s.db"), &tmp.join("mails"), key).unwrap());
+        let mails = vec![make_mail("e1", "a", true), make_mail("e2", "b", true)];
+        let backend = Arc::new(MockBackend::with_mails(mails.clone()));
+        let store = MailStore::new();
+        populate_store(&store, &mails).await;
+        let mut session = ImapSession::new(store, backend, None, Some(local_store));
+        session.handle_command("a LOGIN u p").await;
+        session.handle_command("b SELECT INBOX").await;
+
+        for cmd in [
+            "FETCH 1:2:3 (UID)",
+            "FETCH 0 (UID)",
+            "STORE x +FLAGS (\\Seen)",
+        ] {
+            let resp = session.handle_command(&format!("t {cmd}")).await;
+            assert!(resp[0].starts_with("t BAD"), "{cmd}: {resp:?}");
+        }
+        // A huge range is one pass over the mailbox, not four billion.
+        let started = std::time::Instant::now();
+        let resp = session
+            .handle_command("u UID FETCH 1:4294967295 (UID)")
+            .await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(resp.len(), 3, "{resp:?}");
+
+        let resp = session
+            .handle_command("v SEARCH CHARSET KOI8-R SUBJECT a")
+            .await;
+        assert!(resp[0].starts_with("v NO [BADCHARSET"), "{resp:?}");
+        let resp = session.handle_command("w SEARCH BODY \"!!!\"").await;
+        assert!(resp[0].starts_with("w NO [CANNOT]"), "{resp:?}");
+        // RFC 3501: the empty string is in every message.
+        let resp = session.handle_command("x SEARCH BODY \"\"").await;
+        assert_eq!(resp[0], "* SEARCH 1 2\r\n");
+        // And an empty result has no trailing space.
+        let resp = session.handle_command("y SEARCH SUBJECT zzz").await;
+        assert_eq!(resp[0], "* SEARCH\r\n");
+    }
+
+    #[tokio::test]
+    async fn search_keyword_matches_labelled_mail() {
+        let mut tagged = make_mail("e1", "s", false);
+        tagged.sets = vec![IdTupleGenerated::new(test_id("labels"), test_id("l1"))];
+        let plain = make_mail("e2", "s", false);
+        let backend = Arc::new(MockBackend::with_mails(vec![tagged, plain]));
+        let (store, mut session) = make_session(backend).await;
+        store.set_labels(vec![test_label("l1", "Ephemeral")]).await;
+        session.handle_command("a LOGIN u p").await;
+        session.handle_command("b SELECT INBOX").await;
+
+        // Thunderbird sends keywords lowercased.
+        let resp = session
+            .handle_command("c UID SEARCH KEYWORD ephemeral")
+            .await;
+        assert_eq!(resp[0], "* SEARCH 1\r\n");
+        let resp = session.handle_command("d SEARCH UNKEYWORD Ephemeral").await;
+        assert_eq!(resp[0], "* SEARCH 2\r\n");
+        // An unknown keyword is a real "nothing carries it", not a stub.
+        let resp = session.handle_command("e SEARCH KEYWORD NoSuchTag").await;
+        assert_eq!(resp[0], "* SEARCH\r\n");
+        // A malformed one is an error, never an empty success.
+        // `*` is the last message only (RFC 3501), not all of them.
+        let resp = session.handle_command("g SEARCH *").await;
+        assert_eq!(resp[0], "* SEARCH 2\r\n");
+        let resp = session.handle_command("f UID SEARCH KEYWORD").await;
+        assert!(resp[0].starts_with("f BAD "), "{resp:?}");
+        assert_eq!(resp.len(), 1);
     }
 
     #[tokio::test]
@@ -3301,7 +3376,7 @@ mod tests {
         let resp = session
             .handle_command(r#"A004 SEARCH SUBJECT "invoice" UNSEEN"#)
             .await;
-        assert_eq!(resp[0], "* SEARCH \r\n");
+        assert_eq!(resp[0], "* SEARCH\r\n");
 
         // FROM matches the shared sender on every message.
         let resp = session
@@ -3314,7 +3389,7 @@ mod tests {
         let resp = session
             .handle_command(r#"A006 SEARCH SUBJECT "nonexistent""#)
             .await;
-        assert_eq!(resp[0], "* SEARCH \r\n");
+        assert_eq!(resp[0], "* SEARCH\r\n");
     }
 
     #[tokio::test]
