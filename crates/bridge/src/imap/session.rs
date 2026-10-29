@@ -320,12 +320,65 @@ impl ImapSession {
             return vec![format!("{} NO Not authenticated\r\n", tag)];
         }
         let name = kind.name();
-        let (reference, rest) = parse_imap_token(args.trim());
-        let (pattern, rest) = parse_imap_token(rest.trim_start());
-        if !rest.trim().is_empty() || args.trim().is_empty() {
+        let mut args = args.trim();
+        // LIST-EXTENDED (RFC 5258) is not advertised, but a client may send
+        // its forms anyway. Options that change the answer are applied;
+        // anything else is refused rather than ignored.
+        let mut subscribed_only = false;
+        let mut special_use_only = false;
+        if let (ListKind::List, Some(rest)) = (kind, args.strip_prefix('(')) {
+            let Some((options, rest)) = rest.split_once(')') else {
+                return vec![format!("{tag} BAD unbalanced selection options\r\n")];
+            };
+            for option in options.split_whitespace() {
+                match option.to_ascii_uppercase().as_str() {
+                    "SUBSCRIBED" => subscribed_only = true,
+                    "SPECIAL-USE" => special_use_only = true,
+                    // Only widens which children are reported; we report all.
+                    "RECURSIVEMATCH" => {}
+                    other => {
+                        return vec![format!(
+                            "{tag} BAD selection option {} is not supported\r\n",
+                            other.escape_default()
+                        )]
+                    }
+                }
+            }
+            args = rest.trim_start();
+        }
+        let (reference, rest) = parse_imap_token(args);
+        if args.is_empty() || rest.trim_start().is_empty() {
             return vec![format!(
                 "{tag} BAD {name} needs a reference and a mailbox pattern\r\n"
             )];
+        }
+        let (pattern, rest) = parse_imap_token(rest.trim_start());
+        let mut return_subscribed = false;
+        let mut return_children = false;
+        let rest = rest.trim();
+        if !rest.is_empty() {
+            let options = match (kind, return_options(rest)) {
+                (ListKind::List, Some(options)) => options,
+                _ => {
+                    return vec![format!(
+                        "{tag} BAD unexpected arguments after the pattern\r\n"
+                    )]
+                }
+            };
+            for option in options {
+                match option.to_ascii_uppercase().as_str() {
+                    "SUBSCRIBED" => return_subscribed = true,
+                    "CHILDREN" => return_children = true,
+                    // Special-use flags are always returned.
+                    "SPECIAL-USE" => {}
+                    other => {
+                        return vec![format!(
+                            "{tag} BAD return option {} is not supported\r\n",
+                            other.escape_default()
+                        )]
+                    }
+                }
+            }
         }
 
         // An empty pattern asks only for the hierarchy delimiter.
@@ -338,19 +391,50 @@ impl ImapSession {
 
         let decode = |s: &str| super::utf7::decode(s).unwrap_or_else(|| s.to_string());
         let pattern = format!("{}{}", decode(&reference), decode(&pattern));
-        let unsubscribed = match (kind, &self.local_store) {
-            (ListKind::Lsub, Some(local_store)) => local_store.unsubscribed_folders(),
+        let only_subscribed = kind == ListKind::Lsub || subscribed_only;
+        let unsubscribed = match (only_subscribed || return_subscribed, &self.local_store) {
+            (true, Some(local_store)) => local_store.unsubscribed_folders(),
             _ => Default::default(),
         };
+        let folders = self.store.list_folders().await;
         let mut responses = Vec::new();
-        for folder in self.store.list_folders().await {
-            if !mailbox_matches(&pattern, &folder.imap_path) || unsubscribed.contains(&folder.id) {
+        for folder in &folders {
+            if !mailbox_matches(&pattern, &folder.imap_path) {
                 continue;
             }
-            let flags = folder.special_use.as_deref().unwrap_or("");
+            if special_use_only && folder.special_use.is_none() {
+                continue;
+            }
+            let mut flags: Vec<&str> = folder.special_use.iter().map(String::as_str).collect();
+            let prefix = format!("{}/", folder.imap_path);
+            let subscribed = !unsubscribed.contains(&folder.id);
+            if only_subscribed && !subscribed {
+                // RFC 3501 §6.3.9: an unsubscribed name is listed (as
+                // \Noselect) only when a subscribed name under it exists that
+                // the pattern itself cannot reach — `%` stopping at it.
+                let unreached_below = folders.iter().any(|f| {
+                    f.imap_path.starts_with(&prefix)
+                        && !unsubscribed.contains(&f.id)
+                        && !mailbox_matches(&pattern, &f.imap_path)
+                });
+                if kind == ListKind::List || !unreached_below {
+                    continue;
+                }
+                flags = vec!["\\Noselect"];
+            } else if (subscribed_only || return_subscribed) && subscribed {
+                flags.push("\\Subscribed");
+            }
+            if return_children {
+                let has_children = folders.iter().any(|f| f.imap_path.starts_with(&prefix));
+                flags.push(if has_children {
+                    "\\HasChildren"
+                } else {
+                    "\\HasNoChildren"
+                });
+            }
             responses.push(format!(
                 "* {name} ({}) \"/\" {}\r\n",
-                flags,
+                flags.join(" "),
                 imap_string(&super::utf7::encode(&folder.imap_path))
             ));
         }
@@ -652,8 +736,15 @@ impl ImapSession {
             return vec![format!("{tag} NO Not authenticated\r\n")];
         }
         let (raw_name, _) = parse_imap_token(args.trim());
+        if raw_name.is_empty() {
+            return vec![format!("{tag} BAD {cmd} needs a mailbox name\r\n")];
+        }
         let name = super::utf7::decode(&raw_name).unwrap_or(raw_name);
         let Some(folder) = self.store.folder_by_imap_path(&name).await else {
+            // Not subscribed to a name that does not exist: nothing to undo.
+            if !subscribe {
+                return vec![format!("{tag} OK {cmd} completed\r\n")];
+            }
             return vec![format!("{tag} NO [NONEXISTENT] Mailbox does not exist\r\n")];
         };
         let Some(local_store) = &self.local_store else {
@@ -1859,7 +1950,21 @@ fn parse_login_args(args: &str) -> (String, String) {
     (user, pass)
 }
 
-#[derive(Clone, Copy)]
+/// The option names of a trailing `RETURN (opt …)` (RFC 5258), or `None`
+/// when the text is anything else.
+fn return_options(text: &str) -> Option<Vec<&str>> {
+    let keyword = text.get(..6)?;
+    if !keyword.eq_ignore_ascii_case("RETURN") {
+        return None;
+    }
+    let list = text[6..]
+        .trim_start()
+        .strip_prefix('(')?
+        .strip_suffix(')')?;
+    Some(list.split_whitespace().collect())
+}
+
+#[derive(Clone, Copy, PartialEq)]
 enum ListKind {
     List,
     Lsub,
@@ -1877,43 +1982,36 @@ impl ListKind {
 /// RFC 3501 LIST wildcards over `/`-delimited names. `INBOX` is matched in
 /// any case, as the protocol treats that one name case-insensitively.
 fn mailbox_matches(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    // `INBOX` is the one case-insensitive name: its first five characters
+    // compare without case, wherever the pattern's wildcards put them.
+    let inbox_prefix = name == "INBOX" || name.starts_with("INBOX/");
+    let same = |pc: char, j: usize| {
+        n[j] == pc || (inbox_prefix && j < 5 && n[j].eq_ignore_ascii_case(&pc))
+    };
     // Dynamic programming, not backtracking: the pattern is client input,
     // and `*a*a*a…` would make naive recursion exponential.
-    fn matches(p: &[char], n: &[char]) -> bool {
-        // reach[j]: the pattern prefix read so far can end at name[..j].
-        let mut reach = vec![false; n.len() + 1];
-        reach[0] = true;
-        for &c in p {
-            let mut next = vec![false; n.len() + 1];
-            match c {
-                '*' | '%' => {
-                    for j in 0..=n.len() {
-                        next[j] =
-                            reach[j] || (j > 0 && next[j - 1] && (c == '*' || n[j - 1] != '/'));
-                    }
-                }
-                _ => {
-                    for j in 1..=n.len() {
-                        next[j] = reach[j - 1] && n[j - 1] == c;
-                    }
+    // reach[j]: the pattern prefix read so far can end at name[..j].
+    let mut reach = vec![false; n.len() + 1];
+    reach[0] = true;
+    for &c in &p {
+        let mut next = vec![false; n.len() + 1];
+        match c {
+            '*' | '%' => {
+                for j in 0..=n.len() {
+                    next[j] = reach[j] || (j > 0 && next[j - 1] && (c == '*' || n[j - 1] != '/'));
                 }
             }
-            reach = next;
+            _ => {
+                for j in 1..=n.len() {
+                    next[j] = reach[j - 1] && same(c, j - 1);
+                }
+            }
         }
-        reach[n.len()]
+        reach = next;
     }
-    let fold_inbox = |s: &str| -> Vec<char> {
-        let is_inbox = s.len() >= 5
-            && s.is_char_boundary(5)
-            && s[..5].eq_ignore_ascii_case("INBOX")
-            && (s.len() == 5 || s[5..].starts_with('/'));
-        if is_inbox {
-            format!("INBOX{}", &s[5..]).chars().collect()
-        } else {
-            s.chars().collect()
-        }
-    };
-    matches(&fold_inbox(pattern), &fold_inbox(name))
+    reach[n.len()]
 }
 
 fn parse_imap_token(s: &str) -> (String, &str) {
@@ -3152,6 +3250,10 @@ mod tests {
         assert!(mailbox_matches("inbox", "INBOX"));
         assert!(mailbox_matches("Inbox/%", "INBOX/Sub"));
         assert!(!mailbox_matches("work", "Work"), "only INBOX ignores case");
+        assert!(mailbox_matches("inb%", "INBOX"));
+        assert!(mailbox_matches("inbox*", "INBOX/Sub"));
+        assert!(mailbox_matches("*BOX", "INBOX"));
+        assert!(!mailbox_matches("inb%", "Inbound"));
         assert!(!mailbox_matches("Trash", "Trash2"));
         // Client input: must not go exponential.
         let started = std::time::Instant::now();
@@ -3213,6 +3315,137 @@ mod tests {
         assert_eq!(resp, ["g OK LIST completed\r\n"]);
         let resp = session.handle_command("h LIST").await;
         assert!(resp[0].starts_with("h BAD"), "{resp:?}");
+    }
+
+    #[tokio::test]
+    async fn mailbox_lookup_is_exact_except_for_inbox() {
+        let store = MailStore::new();
+        store
+            .set_folder_list(vec![
+                inbox_folder(),
+                folder("lower", "Work"),
+                folder("upper", "WORK"),
+            ])
+            .await;
+        assert_eq!(store.folder_by_imap_path("WORK").await.unwrap().id, "upper");
+        assert_eq!(store.folder_by_imap_path("Work").await.unwrap().id, "lower");
+        assert!(store.folder_by_imap_path("work").await.is_none());
+        assert_eq!(
+            store.folder_by_imap_path("inbox").await.unwrap().id,
+            "inbox"
+        );
+
+        // The exact name wins, so a custom "Inbox" tree still opens; a unique
+        // case-insensitive match still finds hand-typed system names.
+        let store = MailStore::new();
+        store
+            .set_folder_list(vec![
+                inbox_folder(),
+                folder("ci", "Inbox"),
+                folder("cc", "Inbox/Child"),
+                folder("sent", "Sent"),
+            ])
+            .await;
+        assert_eq!(
+            store.folder_by_imap_path("Inbox/Child").await.unwrap().id,
+            "cc"
+        );
+        assert_eq!(store.folder_by_imap_path("Inbox").await.unwrap().id, "ci");
+        assert_eq!(
+            store.folder_by_imap_path("INBOX").await.unwrap().id,
+            "inbox"
+        );
+        assert_eq!(store.folder_by_imap_path("sent").await.unwrap().id, "sent");
+    }
+
+    #[tokio::test]
+    async fn extended_list_forms_filter_or_answer_bad() {
+        let local_store = temp_local_store();
+        local_store.set_subscribed("w", false).unwrap();
+        let backend = Arc::new(MockBackend::with_mails(vec![]));
+        let store = MailStore::new();
+        let mut trash = folder("t", "Trash");
+        trash.special_use = Some("\\Trash".to_string());
+        store
+            .set_folder_list(vec![inbox_folder(), folder("w", "Work"), trash])
+            .await;
+        let mut session = ImapSession::new(store, backend, None, Some(local_store));
+        session.handle_command("a LOGIN u p").await;
+        let listed = |resp: &[String]| -> Vec<String> {
+            resp.iter()
+                .filter(|r| r.starts_with("* LIST"))
+                .map(|r| r.trim_end().to_string())
+                .collect()
+        };
+        let resp = session
+            .handle_command("b LIST (SUBSCRIBED) \"\" \"*\"")
+            .await;
+        assert_eq!(
+            listed(&resp),
+            [
+                "* LIST (\\Subscribed) \"/\" \"INBOX\"",
+                "* LIST (\\Trash \\Subscribed) \"/\" \"Trash\""
+            ]
+        );
+        let resp = session
+            .handle_command("c LIST (SPECIAL-USE) \"\" \"*\"")
+            .await;
+        assert_eq!(listed(&resp), ["* LIST (\\Trash) \"/\" \"Trash\""]);
+        let resp = session
+            .handle_command("d LIST \"\" \"*\" RETURN (SPECIAL-USE)")
+            .await;
+        assert_eq!(listed(&resp).len(), 3);
+        let resp = session.handle_command("e LIST (REMOTE) \"\" \"*\"").await;
+        assert!(resp[0].starts_with("e BAD"), "{resp:?}");
+        let resp = session
+            .handle_command("e2 LIST \"\" \"*\" RETURN (SUBSCRIBED CHILDREN)")
+            .await;
+        assert_eq!(
+            listed(&resp),
+            [
+                "* LIST (\\Subscribed \\HasNoChildren) \"/\" \"INBOX\"",
+                "* LIST (\\HasNoChildren) \"/\" \"Work\"",
+                "* LIST (\\Trash \\Subscribed \\HasNoChildren) \"/\" \"Trash\""
+            ]
+        );
+        for cmd in [
+            "LIST \"\" \"*\" RETURNX (SUBSCRIBED)",
+            "LIST \"\" \"*\" RETURN",
+            "LIST \"\" \"*\" RETURN (FOO)",
+            "LIST \"\"",
+            "LIST \"\" * aaaaa\u{e9}",
+        ] {
+            let resp = session.handle_command(&format!("t {cmd}")).await;
+            assert!(resp[0].starts_with("t BAD"), "{cmd}: {resp:?}");
+        }
+        let resp = session.handle_command("f LSUB \"\" \"*\" RETURN ()").await;
+        assert!(
+            resp[0].starts_with("f BAD"),
+            "LSUB takes no RETURN: {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lsub_keeps_an_unsubscribed_parent_as_noselect() {
+        let local_store = temp_local_store();
+        local_store.set_subscribed("w", false).unwrap();
+        let backend = Arc::new(MockBackend::with_mails(vec![]));
+        let store = MailStore::new();
+        store
+            .set_folder_list(vec![folder("w", "Work"), folder("wp", "Work/Projects")])
+            .await;
+        let mut session = ImapSession::new(store, backend, None, Some(local_store));
+        session.handle_command("a LOGIN u p").await;
+        let resp = session.handle_command("b LSUB \"\" %").await;
+        assert_eq!(resp[0], "* LSUB (\\Noselect) \"/\" \"Work\"\r\n");
+        // With `*` the pattern reaches the child itself: only it is listed.
+        let resp = session.handle_command("b2 LSUB \"\" *").await;
+        assert_eq!(resp[0], "* LSUB () \"/\" \"Work/Projects\"\r\n");
+        assert_eq!(resp.len(), 2, "{resp:?}");
+        let resp = session.handle_command("c UNSUBSCRIBE Gone").await;
+        assert_eq!(resp, ["c OK UNSUBSCRIBE completed\r\n"]);
+        let resp = session.handle_command("d SUBSCRIBE").await;
+        assert!(resp[0].starts_with("d BAD"), "{resp:?}");
     }
 
     #[tokio::test]
