@@ -586,6 +586,21 @@ impl LocalStore {
         Ok(deleted)
     }
 
+    /// Gives a bare 1 (the column's earlier boolean form) a real time, so
+    /// the age cap applies to it; leaves any other value alone.
+    pub fn stamp_legacy_attachments_pending(&self, element_id: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(1, |d| d.as_millis() as i64);
+        conn.execute(
+            "UPDATE mails SET attachments_pending = ?2
+             WHERE element_id = ?1 AND attachments_pending = 1",
+            rusqlite::params![element_id, now_ms],
+        )?;
+        Ok(())
+    }
+
     /// Whether a mail's rendition on disk still lacks attachments the retry
     /// pass should fetch. Persisted, so a restart does not finalize it
     /// body-only.

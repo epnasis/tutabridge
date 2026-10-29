@@ -2850,6 +2850,30 @@ mod tests {
     }
 
     #[test]
+    fn only_a_legacy_flag_is_stamped_by_a_retry() {
+        let local_store = temp_local_store();
+        local_store
+            .upsert_mail_metadata(&crate::sync::mail_to_metadata(
+                &make_mail("e1", "s", true),
+                "inbox",
+                1,
+            ))
+            .unwrap();
+        // Cleared (e.g. by an on-demand fetch): stays cleared.
+        local_store.stamp_legacy_attachments_pending("e1").unwrap();
+        assert_eq!(local_store.attachments_pending_since("e1").unwrap(), None);
+        local_store.exec_for_test("UPDATE mails SET attachments_pending = 1");
+        local_store.stamp_legacy_attachments_pending("e1").unwrap();
+        assert!(
+            local_store
+                .attachments_pending_since("e1")
+                .unwrap()
+                .unwrap()
+                > 1
+        );
+    }
+
+    #[test]
     fn the_pending_since_time_keeps_the_earliest() {
         let local_store = temp_local_store();
         local_store

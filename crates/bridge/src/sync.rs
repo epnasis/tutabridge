@@ -1180,9 +1180,10 @@ pub(crate) async fn prefetch_details(
             }
             Err(e) if is_transient_attachment_error(&e) && !give_up => {
                 debug!("Attachment retry {attempts} for {eid} still transient: {e}");
-                // Keeps the earliest time; stamps one on a legacy flag.
-                if let Err(e) = local_store.set_attachments_pending(&eid, true) {
-                    warn!("Failed to mark attachments pending {}: {}", eid, e);
+                // Only a legacy flag gets a time: setting the flag here could
+                // undo an on-demand fetch that completed meanwhile.
+                if let Err(e) = local_store.stamp_legacy_attachments_pending(&eid) {
+                    warn!("Failed to stamp attachments pending {}: {}", eid, e);
                 }
             }
             Err(e) => {
