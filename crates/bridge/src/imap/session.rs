@@ -335,8 +335,6 @@ impl ImapSession {
                 match option.to_ascii_uppercase().as_str() {
                     "SUBSCRIBED" => subscribed_only = true,
                     "SPECIAL-USE" => special_use_only = true,
-                    // Only widens which children are reported; we report all.
-                    "RECURSIVEMATCH" => {}
                     other => {
                         return vec![format!(
                             "{tag} BAD selection option {} is not supported\r\n",
@@ -487,8 +485,9 @@ impl ImapSession {
             return vec![format!("{} NO Not authenticated\r\n", tag)];
         }
 
-        let raw_name = args.trim().trim_matches('"');
-        let folder_name = super::utf7::decode(raw_name).unwrap_or_else(|| raw_name.to_string());
+        // A quoted name may carry escapes (`"Say \\"hi\\""`), as LIST sends it.
+        let (raw_name, _) = parse_imap_token(args.trim());
+        let folder_name = super::utf7::decode(&raw_name).unwrap_or_else(|| raw_name.clone());
         let folder = match self.store.folder_by_imap_path(&folder_name).await {
             Some(f) => f,
             None => {
@@ -571,8 +570,13 @@ impl ImapSession {
         };
         vec![
             format!(
-                "* STATUS \"{}\" (MESSAGES {} UNSEEN {} RECENT 0 UIDNEXT {} UIDVALIDITY {})\r\n",
-                raw_name, count, unseen, uid_next, uid_validity
+                "* STATUS {} (MESSAGES {} UNSEEN {} RECENT 0 UIDNEXT {} UIDVALIDITY {})\r\n",
+                // The client's (modified UTF-7) name, quoted and escaped again.
+                imap_string(&raw_name),
+                count,
+                unseen,
+                uid_next,
+                uid_validity
             ),
             format!("{} OK STATUS completed\r\n", tag),
         ]
@@ -2959,6 +2963,37 @@ mod tests {
         assert_eq!(resp, ["c OK UNSUBSCRIBE completed\r\n"]);
         let resp = session.handle_command("d SUBSCRIBE").await;
         assert!(resp[0].starts_with("d BAD"), "{resp:?}");
+    }
+
+    #[tokio::test]
+    async fn names_with_quotes_round_trip_through_select_and_status() {
+        let backend = Arc::new(MockBackend::with_mails(vec![]));
+        let store = MailStore::new();
+        store
+            .set_folder_list(vec![
+                inbox_folder(),
+                folder("q", "Say \"hi\""),
+                folder("b", "a\\b"),
+            ])
+            .await;
+        let mut session = ImapSession::new(store, backend, None, None);
+        session.handle_command("a LOGIN u p").await;
+        let resp = session.handle_command("b SELECT \"Say \\\"hi\\\"\"").await;
+        assert!(resp.last().unwrap().starts_with("b OK"), "{resp:?}");
+        let resp = session.handle_command("c EXAMINE \"a\\\\b\"").await;
+        assert!(resp.last().unwrap().starts_with("c OK"), "{resp:?}");
+        let resp = session
+            .handle_command("d STATUS \"Say \\\"hi\\\"\" (MESSAGES)")
+            .await;
+        assert!(
+            resp[0].starts_with("* STATUS \"Say \\\"hi\\\"\" ("),
+            "{resp:?}"
+        );
+        // RECURSIVEMATCH needs CHILDINFO, which is not implemented: refused.
+        let resp = session
+            .handle_command("e LIST (SUBSCRIBED RECURSIVEMATCH) \"\" %")
+            .await;
+        assert!(resp[0].starts_with("e BAD"), "{resp:?}");
     }
 
     #[tokio::test]
