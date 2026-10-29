@@ -498,8 +498,9 @@ impl ImapSession {
     /// Tuta's "delete folder" outside Trash/Spam (web client
     /// `trashFolderAndSubfolders`): empty subfolders are deleted deepest
     /// first, then the folder itself if it is empty with nothing left under
-    /// it; otherwise it moves under Trash, recoverable. Trash/Spam refuse
-    /// empty folders, which is why empties are deleted instead of moved.
+    /// it; otherwise it moves under Trash, recoverable. Empties are deleted
+    /// rather than moved because Tuta's client does so (its comment: Trash
+    /// and Spam do not allow empty folders; not checked against the server).
     /// Returns whether the folder still exists (now under `target`).
     async fn trash_or_delete(
         &self,
@@ -525,8 +526,52 @@ impl ImapSession {
             self.backend.delete_folder(folder).await?;
             return Ok(false);
         }
+        // Tuta allows two siblings with one name, IMAP cannot address them:
+        // a folder arriving where its name is taken gets a free one.
+        let leaf = folder.imap_path.rsplit('/').next().unwrap_or_default();
+        let mut free = leaf.to_string();
+        let mut n = 2;
+        while self
+            .store
+            .folder_by_exact_path(&format!("{}/{free}", target.imap_path))
+            .await
+            .is_some()
+        {
+            free = format!("{leaf} ({n})");
+            n += 1;
+        }
         self.backend.move_folder(folder, Some(target)).await?;
+        if free != leaf {
+            self.refresh_folders().await?;
+            let moved = self
+                .store
+                .list_folders()
+                .await
+                .into_iter()
+                .find(|f| f.id == folder.id)
+                .ok_or("the folder vanished while being moved to Trash")?;
+            self.backend.rename_folder(&moved, &free).await?;
+        }
         Ok(true)
+    }
+
+    /// After a DELETE or RENAME: follow the selected folder by id (it may
+    /// have moved), or leave Selected if it is gone — the target itself or
+    /// a subfolder deleted with it.
+    async fn deselect_if_gone(&mut self) {
+        let Some(selected) = &self.selected_folder else {
+            return;
+        };
+        let id = selected.id.clone();
+        self.selected_folder = self
+            .store
+            .list_folders()
+            .await
+            .into_iter()
+            .find(|f| f.id == id);
+        if self.selected_folder.is_none() {
+            self.state = State::Authenticated;
+        }
     }
 
     /// CREATE, with any missing parent created first (RFC 3501 §6.3.3).
@@ -627,10 +672,7 @@ impl ImapSession {
         if let Err(e) = self.refresh_folders().await {
             return self.folder_failure(tag, "DELETE", &name, &e).await;
         }
-        if self.selected_folder.as_ref().map(|f| &f.id) == Some(&folder.id) {
-            self.selected_folder = None;
-            self.state = State::Authenticated;
-        }
+        self.deselect_if_gone().await;
         vec![format!("{tag} OK DELETE completed ({outcome})\r\n")]
     }
 
@@ -677,6 +719,20 @@ impl ImapSession {
             },
             None => None,
         };
+        // The destination as it will exist: the resolved parent plus the new
+        // leaf. Checking only the typed name let `RENAME X work/X` land on an
+        // existing Work/X.
+        let destination = match &new_parent {
+            Some(parent) => format!("{}/{new_leaf}", parent.imap_path),
+            None => new_leaf.clone(),
+        };
+        if let Some(existing) = self.store.folder_by_exact_path(&destination).await {
+            if existing.id != folder.id {
+                return vec![format!(
+                    "{tag} NO [ALREADYEXISTS] Mailbox already exists\r\n"
+                )];
+            }
+        }
         // Compared as resolved folders, not as typed text: the client's
         // casing must not hide that the target is the folder or under it.
         if let Some(parent) = &new_parent {
@@ -739,24 +795,12 @@ impl ImapSession {
         if let Err(e) = self.refresh_folders().await {
             return self.folder_failure(tag, "RENAME", &old_name, &e).await;
         }
-        if self.selected_folder.as_ref().map(|f| &f.id) == Some(&folder.id) {
-            // By id: the folder may now be elsewhere, or (an empty one moved
-            // to Trash) gone.
-            self.selected_folder = self
-                .store
-                .list_folders()
-                .await
-                .into_iter()
-                .find(|f| f.id == folder.id);
-            if self.selected_folder.is_none() {
-                self.state = State::Authenticated;
-            }
-        }
+        self.deselect_if_gone().await;
         if still_there {
             vec![format!("{tag} OK RENAME completed\r\n")]
         } else {
             vec![format!(
-                "{tag} OK RENAME completed (deleted: Trash takes no empty folders)\r\n"
+                "{tag} OK RENAME completed (it was empty, so it was deleted)\r\n"
             )]
         }
     }
@@ -2738,9 +2782,11 @@ mod tests {
 
         /// Re-root `folder` and everything under it at `new_path`.
         fn repath(&self, folder: &FolderInfo, new_path: &str) {
+            // The folder by id, as the server addresses it; descendants by
+            // path (a duplicate sibling has none in these tests).
             let old = folder.imap_path.clone();
             for f in self.folders.lock().unwrap().iter_mut() {
-                if f.imap_path == old {
+                if f.id == folder.id {
                     f.imap_path = new_path.to_string();
                 } else if let Some(rest) = f.imap_path.strip_prefix(&format!("{old}/")) {
                     f.imap_path = format!("{new_path}/{rest}");
@@ -3227,6 +3273,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn folder_operations_never_make_two_folders_of_one_name() {
+        let (backend, store, mut session) = folder_session().await;
+        session.handle_command("b CREATE Work/X").await;
+        session.handle_command("c CREATE X").await;
+        ops(&backend);
+        // The resolved destination exists, whatever casing the client used.
+        let resp = session.handle_command("d RENAME X work/X").await;
+        assert!(resp[0].starts_with("d NO [ALREADYEXISTS]"), "{resp:?}");
+        assert!(ops(&backend).is_empty());
+
+        // Deleting a second folder of a name Trash already holds.
+        for round in ["e", "f"] {
+            session
+                .handle_command(&format!("{round}1 CREATE Note"))
+                .await;
+            let id = id_of(&store, "Note").await;
+            backend.nonempty.lock().unwrap().insert(id);
+            let resp = session
+                .handle_command(&format!("{round}2 DELETE Note"))
+                .await;
+            assert!(resp[0].contains("(moved to Trash)"), "{resp:?}");
+        }
+        let names = paths(&store).await;
+        assert!(names.contains(&"Trash/Note".to_string()), "{names:?}");
+        assert!(names.contains(&"Trash/Note (2)".to_string()), "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn deleting_the_selected_folders_parent_deselects_it() {
+        let (_, _, mut session) = folder_session().await;
+        session.handle_command("b CREATE Gone/Sub").await;
+        session.handle_command("c SELECT Gone/Sub").await;
+        let resp = session.handle_command("d DELETE Gone").await;
+        assert!(resp[0].starts_with("d OK"), "{resp:?}");
+        let resp = session.handle_command("e FETCH 1 (FLAGS)").await;
+        assert!(resp[0].starts_with("e NO"), "still selected: {resp:?}");
+    }
+
+    #[tokio::test]
     async fn delete_does_what_tutas_own_client_does() {
         let (backend, store, mut session) = folder_session().await;
         session.handle_command("b CREATE Empty").await;
@@ -3306,7 +3391,7 @@ mod tests {
         let resp = session.handle_command("g RENAME Old Trash/Old").await;
         assert_eq!(
             resp,
-            ["g OK RENAME completed (deleted: Trash takes no empty folders)\r\n"]
+            ["g OK RENAME completed (it was empty, so it was deleted)\r\n"]
         );
         assert_eq!(ops(&backend), ["delete Old"]);
 

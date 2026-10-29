@@ -1181,9 +1181,9 @@ impl MailBackend for TutaSession {
     }
 
     async fn folder_is_empty(&self, folder: &FolderInfo) -> Result<bool, String> {
-        // Ascending from the smallest id, as TS `isEmptyFolder`
-        // (CUSTOM_MIN_ID, 1, false): descending from it reads below the
-        // minimum and always finds nothing — every folder would look empty.
+        // Ascending from the smallest id, exactly as TS `isEmptyFolder`
+        // (CUSTOM_MIN_ID, 1, false). How the server answers a descending
+        // read from that id is not established, so the TS form is used.
         let entries: Vec<MailSetEntry> = self
             .crypto_client()
             .load_range(

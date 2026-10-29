@@ -134,12 +134,6 @@ impl MailStore {
         self.folder_list.read().await.clone()
     }
 
-    /// Look up a folder by its IMAP path (case-insensitive for INBOX).
-    /// Mailbox names are case-sensitive except `INBOX` (RFC 3501 §5.1).
-    /// Looked up in that order: the exact name (so a custom "Inbox/Child"
-    /// still opens), `INBOX` in any case, then a case-insensitive match only
-    /// when it is unique — a hand-typed `sent` still finds Sent, but `WORK`
-    /// never acts on `Work` while both exist.
     /// The folder with exactly this name (INBOX in any case) — for "does
     /// this name exist?", where a near-miss in another casing must not count.
     pub async fn folder_by_exact_path(&self, path: &str) -> Option<FolderInfo> {
@@ -152,6 +146,11 @@ impl MailStore {
         list.iter().find(|f| f.imap_path == path).cloned()
     }
 
+    /// Mailbox names are case-sensitive except `INBOX` (RFC 3501 §5.1).
+    /// Looked up in that order: the exact name (so a custom "Inbox/Child"
+    /// still opens), `INBOX` in any case, then a case-insensitive match only
+    /// when it is unique — a hand-typed `sent` still finds Sent, but `WORK`
+    /// never acts on `Work` while both exist.
     pub async fn folder_by_imap_path(&self, path: &str) -> Option<FolderInfo> {
         let list = self.folder_list.read().await;
         if let Some(exact) = list.iter().find(|f| f.imap_path == path) {
