@@ -2797,6 +2797,42 @@ mod tests {
         assert!(!store.get_folder("inbox").await[0].attachments_pending);
     }
 
+    #[test]
+    fn attachment_errors_that_may_pass_are_transient() {
+        use crate::sync::is_transient_attachment_error as transient;
+        // The SDK's own wording (ApiCallError / HttpError Display).
+        assert!(transient("ServerResponseError: Too Many Requests"));
+        assert!(transient("ServerResponseError: Service Unavailable"));
+        assert!(transient("Rest client error, source: connection reset"));
+        assert!(transient(
+            "InternalSdkError: Session key resolution failure: instance missing owner key/group data"
+        ));
+        assert!(!transient("ServerResponseError: Not Found"));
+    }
+
+    #[tokio::test]
+    async fn a_retry_that_fails_for_good_keeps_the_body() {
+        let (_, backend, local_store, store) = on_demand_fetch(true).await;
+        assert!(!local_store.has_eml("od"), "transient first: memory only");
+        *backend.attachments_fail_for_good.lock().unwrap() = true;
+        crate::sync::prefetch_details(
+            &store,
+            &local_store,
+            &*backend,
+            &inbox_folder(),
+            0,
+            &mut std::collections::HashMap::new(),
+        )
+        .await;
+        assert!(!store.get_folder("inbox").await[0].attachments_pending);
+        assert!(local_store.has_eml("od"));
+        assert!(local_store.load_folder_metadata("inbox").unwrap()[0].has_details);
+        assert_eq!(
+            local_store.search_body("quokka").unwrap(),
+            vec!["od".to_string()]
+        );
+    }
+
     #[tokio::test]
     async fn a_successful_attachment_retry_completes_an_on_demand_fetch() {
         let (_, backend, local_store, store) = on_demand_fetch(true).await;

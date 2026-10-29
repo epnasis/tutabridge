@@ -1058,6 +1058,25 @@ pub(crate) async fn prefetch_details(
                     "Attachment retry for {} failed permanently: {e} — giving up",
                     eid
                 );
+                // A mail first fetched on demand has its body only in
+                // memory: keep it, body-only, as prefetch does on a
+                // permanent failure. (A prefetched one is already on disk.)
+                if !local_store.has_eml(&eid) {
+                    if let Some(rfc) = stored.rfc2822.as_deref() {
+                        if let Err(e) = local_store.write_eml(&eid, rfc) {
+                            warn!("Failed to cache eml {}: {}", eid, e);
+                        } else {
+                            if let Err(e) = local_store.mark_has_details(&eid) {
+                                warn!("Failed to mark has_details {}: {}", eid, e);
+                            }
+                            if let Err(e) =
+                                local_store.index_body(&eid, &strip_html(body_html(details)))
+                            {
+                                warn!("Failed to index body {}: {}", eid, e);
+                            }
+                        }
+                    }
+                }
                 // Clear the pending flag so we don't keep retrying a
                 // permanent failure (e.g. server returned 404).
                 store
@@ -1073,15 +1092,30 @@ pub(crate) async fn prefetch_details(
     }
 }
 
-/// True when an attachment-load failure is the well-known
-/// "freshly-created File without propagated session-key" race that the
-/// `TutaSession::load_file_with_retry` helper logs as
-/// "still not decryptable after retries". Matching on the string keeps us
-/// decoupled from the SDK error variant tree.
+/// True when an attachment-load failure may succeed later, so the mail
+/// waits for the retry pass instead of shipping body-only for good (a
+/// body-only rendition on disk is never refetched). Matched on the SDK's
+/// error text (`ApiCallError` / `HttpError` Display), which keeps us
+/// decoupled from its variant tree:
+/// - the session-key race on a freshly created File;
+/// - throttling, server-side and network trouble (429, 503, 408, 502,
+///   500, 423, an expired session, a failed request).
+///
+/// Anything else (e.g. "Not Found") is taken as permanent.
 pub(crate) fn is_transient_attachment_error(err: &str) -> bool {
-    err.contains("missing owner key/group data")
-        || err.contains("Session key resolution failure")
-        || err.contains("still not decryptable")
+    const TRANSIENT: [&str; 10] = [
+        "missing owner key/group data",
+        "Session key resolution failure",
+        "Too Many Requests",
+        "Service Unavailable",
+        "Request Timeout",
+        "Bad gateway",
+        "Internal Server",
+        "Locked",
+        "Session Expired",
+        "Rest client error",
+    ];
+    TRANSIENT.iter().any(|marker| err.contains(marker))
 }
 
 async fn retry<F, Fut, T>(mut f: F) -> Result<T, String>
