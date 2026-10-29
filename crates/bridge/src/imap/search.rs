@@ -103,6 +103,10 @@ pub enum SearchKey {
 
     Uid(SeqSet),
     Sequence(SeqSet),
+
+    /// A criterion the client got wrong; the whole SEARCH answers BAD rather
+    /// than an empty success that would read as "no such mail".
+    Invalid(String),
 }
 
 /// The slice of a message the matcher needs. Derived fields (From / To / Cc /
@@ -249,6 +253,7 @@ pub fn matches(key: &SearchKey, m: &MsgView, ctx: &SearchContext) -> bool {
         SearchKey::Smaller(n) => m.size < *n,
 
         SearchKey::Uid(set) => set.contains(m.uid),
+        SearchKey::Invalid(_) => false,
         SearchKey::Sequence(set) => set.contains(m.seq),
     }
 }
@@ -352,6 +357,42 @@ fn parse_key_list(tokens: &[Token], i: &mut usize, in_group: bool) -> Vec<Search
 }
 
 /// Read the next token as a string argument (atom or quoted), advancing.
+/// `KEYWORD`/`UNKEYWORD` take a flag keyword, which is an atom (RFC 3501):
+/// a missing one, or one with atom-specials (`\Seen` is a system flag, not a
+/// keyword), is a client error.
+fn keyword_key(
+    tokens: &[Token],
+    i: &mut usize,
+    name: &str,
+    ctor: fn(String) -> SearchKey,
+) -> SearchKey {
+    match next_arg(tokens, i) {
+        Some(keyword) if is_flag_keyword(&keyword) => ctor(keyword),
+        Some(other) => SearchKey::Invalid(format!("{name} {other:?} is not a keyword atom")),
+        None => SearchKey::Invalid(format!("{name} needs a keyword")),
+    }
+}
+
+fn is_flag_keyword(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().all(|c| {
+            c.is_ascii_graphic() && !matches!(c, '(' | ')' | '{' | '%' | '*' | '"' | '\\' | ']')
+        })
+}
+
+impl SearchKey {
+    /// Why the query is malformed, if any criterion in it is.
+    pub fn invalid_reason(&self) -> Option<&str> {
+        match self {
+            SearchKey::Invalid(reason) => Some(reason),
+            SearchKey::And(keys) => keys.iter().find_map(SearchKey::invalid_reason),
+            SearchKey::Or(a, b) => a.invalid_reason().or_else(|| b.invalid_reason()),
+            SearchKey::Not(k) => k.invalid_reason(),
+            _ => None,
+        }
+    }
+}
+
 fn next_arg(tokens: &[Token], i: &mut usize) -> Option<String> {
     match tokens.get(*i) {
         Some(Token::Atom(s)) | Some(Token::Quoted(s)) => {
@@ -419,8 +460,8 @@ fn parse_atom_key(atom: &str, tokens: &[Token], i: &mut usize) -> SearchKey {
         "BCC" => str_key(tokens, i, SearchKey::Bcc),
         "BODY" => str_key(tokens, i, SearchKey::Body),
         "TEXT" => str_key(tokens, i, SearchKey::Text),
-        "KEYWORD" => SearchKey::Keyword(next_arg(tokens, i).unwrap_or_default()),
-        "UNKEYWORD" => SearchKey::Unkeyword(next_arg(tokens, i).unwrap_or_default()),
+        "KEYWORD" => keyword_key(tokens, i, "KEYWORD", SearchKey::Keyword),
+        "UNKEYWORD" => keyword_key(tokens, i, "UNKEYWORD", SearchKey::Unkeyword),
         "HEADER" => {
             let name = next_arg(tokens, i).unwrap_or_default();
             let value = next_arg(tokens, i).unwrap_or_default();
@@ -569,6 +610,23 @@ mod tests {
             deleted: false,
             size: 5000,
             keywords: vec!["Work", "$label1"],
+        }
+    }
+
+    #[test]
+    fn malformed_keyword_criteria_are_invalid_not_empty() {
+        for query in [
+            "KEYWORD",
+            "KEYWORD \\Seen",
+            "KEYWORD (SEEN)",
+            "(KEYWORD) SEEN",
+            "NOT UNKEYWORD",
+            "OR SEEN KEYWORD a*b",
+        ] {
+            assert!(parse(query).invalid_reason().is_some(), "{query}");
+        }
+        for query in ["KEYWORD work", "KEYWORD $label1", "UNKEYWORD \"work\""] {
+            assert!(parse(query).invalid_reason().is_none(), "{query}");
         }
     }
 

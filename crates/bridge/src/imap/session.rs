@@ -514,6 +514,9 @@ impl ImapSession {
         }
 
         let query = search::parse(args);
+        if let Some(reason) = query.invalid_reason() {
+            return vec![format!("{tag} BAD {reason}\r\n")];
+        }
         let ctx = self.resolve_body_search(&query);
         let labels = self.store.label_registry().await;
 
@@ -2428,6 +2431,10 @@ mod tests {
         // An unknown keyword is a real "nothing carries it", not a stub.
         let resp = session.handle_command("e SEARCH KEYWORD NoSuchTag").await;
         assert_eq!(resp[0], "* SEARCH \r\n");
+        // A malformed one is an error, never an empty success.
+        let resp = session.handle_command("f UID SEARCH KEYWORD").await;
+        assert!(resp[0].starts_with("f BAD "), "{resp:?}");
+        assert_eq!(resp.len(), 1);
     }
 
     #[tokio::test]
