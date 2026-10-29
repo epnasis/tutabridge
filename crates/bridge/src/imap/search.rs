@@ -74,8 +74,9 @@ pub enum SearchKey {
     Recent,
     New,
     Old,
-    Keyword,
-    Unkeyword,
+    /// A keyword (Thunderbird tag, i.e. a Tuta label) the mail carries.
+    Keyword(String),
+    Unkeyword(String),
 
     // Header / string predicates (case-insensitive substring).
     Subject(String),
@@ -127,6 +128,8 @@ pub struct MsgView<'a> {
     pub unread: bool,
     pub deleted: bool,
     pub size: u64,
+    /// The keywords FETCH FLAGS reports for this mail.
+    pub keywords: Vec<&'a str>,
 }
 
 /// Pre-resolved full-text results for one SEARCH: maps each `BODY`/`TEXT` term
@@ -221,8 +224,10 @@ pub fn matches(key: &SearchKey, m: &MsgView, ctx: &SearchContext) -> bool {
         SearchKey::Recent => false,
         SearchKey::New => false, // RECENT && UNSEEN — we never flag \Recent
         SearchKey::Old => true,
-        SearchKey::Keyword => false,
-        SearchKey::Unkeyword => true,
+        // Flags compare case-insensitively (RFC 3501), and Thunderbird
+        // lowercases the keywords it sends.
+        SearchKey::Keyword(k) => m.keywords.iter().any(|kw| kw.eq_ignore_ascii_case(k)),
+        SearchKey::Unkeyword(k) => !m.keywords.iter().any(|kw| kw.eq_ignore_ascii_case(k)),
 
         SearchKey::Subject(s) => contains_ci(m.subject, s),
         SearchKey::From(s) => contains_ci(&m.from, s),
@@ -414,14 +419,8 @@ fn parse_atom_key(atom: &str, tokens: &[Token], i: &mut usize) -> SearchKey {
         "BCC" => str_key(tokens, i, SearchKey::Bcc),
         "BODY" => str_key(tokens, i, SearchKey::Body),
         "TEXT" => str_key(tokens, i, SearchKey::Text),
-        "KEYWORD" => {
-            let _ = next_arg(tokens, i);
-            SearchKey::Keyword
-        }
-        "UNKEYWORD" => {
-            let _ = next_arg(tokens, i);
-            SearchKey::Unkeyword
-        }
+        "KEYWORD" => SearchKey::Keyword(next_arg(tokens, i).unwrap_or_default()),
+        "UNKEYWORD" => SearchKey::Unkeyword(next_arg(tokens, i).unwrap_or_default()),
         "HEADER" => {
             let name = next_arg(tokens, i).unwrap_or_default();
             let value = next_arg(tokens, i).unwrap_or_default();
@@ -569,7 +568,21 @@ mod tests {
             unread: true,
             deleted: false,
             size: 5000,
+            keywords: vec!["Work", "$label1"],
         }
+    }
+
+    #[test]
+    fn keyword_matches_case_insensitively() {
+        let m = view();
+        let ctx = SearchContext::default();
+        assert!(matches(&parse("KEYWORD work"), &m, &ctx));
+        assert!(matches(&parse("KEYWORD $Label1"), &m, &ctx));
+        assert!(!matches(&parse("KEYWORD Home"), &m, &ctx));
+        assert!(!matches(&parse("UNKEYWORD WORK"), &m, &ctx));
+        assert!(matches(&parse("UNKEYWORD Home"), &m, &ctx));
+        // The atom is consumed: the next key still applies.
+        assert!(!matches(&parse("KEYWORD work SEEN"), &m, &ctx));
     }
 
     /// A context where the given terms all hit our test message ("mail1").

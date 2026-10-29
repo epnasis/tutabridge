@@ -224,7 +224,7 @@ impl ImapSession {
             "UID" => self.cmd_uid(&tag, &args).await,
             "CLOSE" => self.cmd_close(&tag),
             "EXPUNGE" => self.cmd_expunge(&tag).await,
-            "SEARCH" => self.cmd_search(&tag, &args, false),
+            "SEARCH" => self.cmd_search(&tag, &args, false).await,
             "STORE" => self.cmd_store(&tag, &args, false).await,
             "MOVE" => self.cmd_move(&tag, &args, false).await,
             "COPY" => self.cmd_copy(&tag),
@@ -508,20 +508,21 @@ impl ImapSession {
         responses
     }
 
-    fn cmd_search(&self, tag: &str, args: &str, uid_mode: bool) -> Vec<String> {
+    async fn cmd_search(&self, tag: &str, args: &str, uid_mode: bool) -> Vec<String> {
         if self.state != State::Selected {
             return vec![format!("{} NO No mailbox selected\r\n", tag)];
         }
 
         let query = search::parse(args);
         let ctx = self.resolve_body_search(&query);
+        let labels = self.store.label_registry().await;
 
         let ids: Vec<u32> = self
             .mails
             .iter()
             .enumerate()
             .filter(|(i, cached)| {
-                let view = Self::build_search_view(*i, cached);
+                let view = Self::build_search_view(*i, cached, &labels);
                 search::matches(&query, &view, &ctx)
             })
             .map(|(i, cached)| if uid_mode { cached.uid } else { (i + 1) as u32 })
@@ -543,7 +544,11 @@ impl ImapSession {
     /// Project a cached message onto the fields IMAP SEARCH compares. Derived
     /// strings (From / To / Cc / Bcc / headers) are owned by the [`MsgView`];
     /// the cheap ones (subject, body) borrow straight from `cached`.
-    fn build_search_view(idx: usize, cached: &CachedMail) -> MsgView<'_> {
+    fn build_search_view<'a>(
+        idx: usize,
+        cached: &'a CachedMail,
+        labels: &'a LabelRegistry,
+    ) -> MsgView<'a> {
         let headers = cached
             .rfc2822
             .as_deref()
@@ -598,6 +603,14 @@ impl ImapSession {
             unread: cached.mail.unread,
             deleted: cached.deleted,
             size: cached.rfc2822.as_ref().map(|r| r.len() as u64).unwrap_or(0),
+            // Same resolution as FETCH FLAGS: only label ids are in the
+            // registry, so the folder entry of `Mail.sets` drops out.
+            keywords: cached
+                .mail
+                .sets
+                .iter()
+                .filter_map(|set| labels.keyword_for_label(set.element_id.0.as_str()))
+                .collect(),
         }
     }
 
@@ -852,7 +865,7 @@ impl ImapSession {
 
         match subcmd.as_str() {
             "FETCH" => self.cmd_fetch(tag, subargs, true).await,
-            "SEARCH" => self.cmd_search(tag, subargs, true),
+            "SEARCH" => self.cmd_search(tag, subargs, true).await,
             "STORE" => self.cmd_store(tag, subargs, true).await,
             "MOVE" => self.cmd_move(tag, subargs, true).await,
             "COPY" => self.cmd_copy(tag),
@@ -2392,6 +2405,29 @@ mod tests {
             .sets
             .iter()
             .any(|s| s.element_id.to_string() == "l1"));
+    }
+
+    #[tokio::test]
+    async fn search_keyword_matches_labelled_mail() {
+        let mut tagged = make_mail("e1", "s", false);
+        tagged.sets = vec![IdTupleGenerated::new(test_id("labels"), test_id("l1"))];
+        let plain = make_mail("e2", "s", false);
+        let backend = Arc::new(MockBackend::with_mails(vec![tagged, plain]));
+        let (store, mut session) = make_session(backend).await;
+        store.set_labels(vec![test_label("l1", "Ephemeral")]).await;
+        session.handle_command("a LOGIN u p").await;
+        session.handle_command("b SELECT INBOX").await;
+
+        // Thunderbird sends keywords lowercased.
+        let resp = session
+            .handle_command("c UID SEARCH KEYWORD ephemeral")
+            .await;
+        assert_eq!(resp[0], "* SEARCH 1\r\n");
+        let resp = session.handle_command("d SEARCH UNKEYWORD Ephemeral").await;
+        assert_eq!(resp[0], "* SEARCH 2\r\n");
+        // An unknown keyword is a real "nothing carries it", not a stub.
+        let resp = session.handle_command("e SEARCH KEYWORD NoSuchTag").await;
+        assert_eq!(resp[0], "* SEARCH \r\n");
     }
 
     #[tokio::test]
