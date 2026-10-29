@@ -157,6 +157,19 @@ Tuta labels (`MailSet`s with `kind == Label`) are exposed as IMAP keywords
 2. **Phase 2 (slow, ~2min)**: Prefetch mail details (body) one by one with rate limiting (150ms/mail). Bodies become available progressively.
 3. Wait 60s, repeat.
 
+### Attachments that fail transiently
+
+A body whose attachments fail with a transient error (throttling,
+network, session key not yet available, 474) is served and cached
+body-only and marked pending: `mails.attachments_pending` holds the ms
+time it first went pending (0 = not; a bare 1 is the column's earlier
+boolean form, read as "age unknown" and restamped on the next retry).
+Each prefetch cycle retries pending mails that have a body in memory,
+backing off 60s doubling to 6h, and gives up after 10 attempts or 3 days
+pending — the age survives restarts, the attempt count does not. Any fetch
+that gets every attachment, or finds no details, clears the flag. A
+permanent error keeps the body without attachments.
+
 ## Testing
 
 ### Unit tests
