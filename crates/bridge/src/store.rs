@@ -16,7 +16,9 @@ const SCHEMA_VERSION: &str = "5";
 /// rendition is already cached. A mismatch deletes every `.eml.enc` and
 /// clears `has_details`, so the prefetch loop and on-demand FETCH re-render
 /// them. "2": every rendition carries `X-Tutabridge-Authentication`.
-const RENDITION_VERSION: &str = "2";
+/// "3": renditions carry Bcc when the mail has one (a reopened draft lost
+/// its Bcc recipients).
+const RENDITION_VERSION: &str = "3";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
