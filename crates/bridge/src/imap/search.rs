@@ -321,11 +321,24 @@ fn tokenize(input: &str) -> Vec<Token> {
 }
 
 /// Parse a full SEARCH argument string into a single composite key.
+///
+/// Anything malformed becomes [`SearchKey::Invalid`] (the session answers
+/// BAD) rather than a fallback: a fallback is a silent wrong answer, and
+/// under `NOT` an empty success.
 pub fn parse(args: &str) -> SearchKey {
     let tokens = tokenize(args);
     let mut i = 0;
     let keys = parse_key_list(&tokens, &mut i, false);
+    if keys.is_empty() {
+        return SearchKey::Invalid("SEARCH needs at least one criterion".to_owned());
+    }
     fold_and(keys)
+}
+
+/// Client text quoted for a response line: response text is 7-bit and one
+/// line, so anything else is escaped.
+fn echo(s: &str) -> String {
+    format!("\"{}\"", s.escape_default())
 }
 
 fn fold_and(mut keys: Vec<SearchKey>) -> SearchKey {
@@ -344,14 +357,18 @@ fn parse_key_list(tokens: &[Token], i: &mut usize, in_group: bool) -> Vec<Search
         if tokens[*i] == Token::RParen {
             *i += 1; // consume ')'
             if in_group {
-                break;
+                return keys;
             }
-            continue; // stray ')' at top level — ignore
+            keys.push(SearchKey::Invalid("unbalanced \")\"".to_owned()));
+            continue;
         }
         match parse_key(tokens, i) {
             Some(k) => keys.push(k),
             None => break,
         }
+    }
+    if in_group {
+        keys.push(SearchKey::Invalid("unbalanced \"(\"".to_owned()));
     }
     keys
 }
@@ -368,7 +385,7 @@ fn keyword_key(
 ) -> SearchKey {
     match next_arg(tokens, i) {
         Some(keyword) if is_flag_keyword(&keyword) => ctor(keyword),
-        Some(other) => SearchKey::Invalid(format!("{name} {other:?} is not a keyword atom")),
+        Some(other) => SearchKey::Invalid(format!("{name} {} is not a keyword atom", echo(&other))),
         None => SearchKey::Invalid(format!("{name} needs a keyword")),
     }
 }
@@ -409,11 +426,19 @@ fn parse_key(tokens: &[Token], i: &mut usize) -> Option<SearchKey> {
     *i += 1;
 
     match token {
-        Token::LParen => Some(fold_and(parse_key_list(tokens, i, true))),
+        Token::LParen => {
+            let keys = parse_key_list(tokens, i, true);
+            Some(if keys.is_empty() {
+                SearchKey::Invalid("empty \"()\"".to_owned())
+            } else {
+                fold_and(keys)
+            })
+        }
         Token::RParen => None,
-        // A stray quoted string in key position can't be a criterion; ignore it
-        // non-restrictively.
-        Token::Quoted(_) => Some(SearchKey::All),
+        Token::Quoted(text) => Some(SearchKey::Invalid(format!(
+            "{} is not a search key",
+            echo(&text)
+        ))),
         Token::Atom(atom) => Some(parse_atom_key(&atom, tokens, i)),
     }
 }
@@ -437,82 +462,100 @@ fn parse_atom_key(atom: &str, tokens: &[Token], i: &mut usize) -> SearchKey {
         "OLD" => SearchKey::Old,
 
         "OR" => {
-            let a = parse_key(tokens, i).unwrap_or(SearchKey::All);
-            let b = parse_key(tokens, i).unwrap_or(SearchKey::All);
+            let missing = || SearchKey::Invalid("OR needs two criteria".to_owned());
+            let a = parse_key(tokens, i).unwrap_or_else(missing);
+            let b = parse_key(tokens, i).unwrap_or_else(missing);
             SearchKey::Or(Box::new(a), Box::new(b))
         }
         "NOT" => {
-            let a = parse_key(tokens, i).unwrap_or(SearchKey::All);
+            let a = parse_key(tokens, i)
+                .unwrap_or_else(|| SearchKey::Invalid("NOT needs a criterion".to_owned()));
             SearchKey::Not(Box::new(a))
         }
 
         // `CHARSET <name>` is a prefix, not a criterion — skip the name and
         // parse the key that follows.
-        "CHARSET" => {
-            let _ = next_arg(tokens, i);
-            parse_key(tokens, i).unwrap_or(SearchKey::All)
-        }
+        "CHARSET" => match next_arg(tokens, i) {
+            Some(_) => parse_key(tokens, i).unwrap_or_else(|| {
+                SearchKey::Invalid("CHARSET needs a criterion after it".to_owned())
+            }),
+            None => SearchKey::Invalid("CHARSET needs a name".to_owned()),
+        },
 
-        "SUBJECT" => str_key(tokens, i, SearchKey::Subject),
-        "FROM" => str_key(tokens, i, SearchKey::From),
-        "TO" => str_key(tokens, i, SearchKey::To),
-        "CC" => str_key(tokens, i, SearchKey::Cc),
-        "BCC" => str_key(tokens, i, SearchKey::Bcc),
-        "BODY" => str_key(tokens, i, SearchKey::Body),
-        "TEXT" => str_key(tokens, i, SearchKey::Text),
+        "SUBJECT" => str_key(tokens, i, "SUBJECT", SearchKey::Subject),
+        "FROM" => str_key(tokens, i, "FROM", SearchKey::From),
+        "TO" => str_key(tokens, i, "TO", SearchKey::To),
+        "CC" => str_key(tokens, i, "CC", SearchKey::Cc),
+        "BCC" => str_key(tokens, i, "BCC", SearchKey::Bcc),
+        "BODY" => str_key(tokens, i, "BODY", SearchKey::Body),
+        "TEXT" => str_key(tokens, i, "TEXT", SearchKey::Text),
         "KEYWORD" => keyword_key(tokens, i, "KEYWORD", SearchKey::Keyword),
         "UNKEYWORD" => keyword_key(tokens, i, "UNKEYWORD", SearchKey::Unkeyword),
-        "HEADER" => {
-            let name = next_arg(tokens, i).unwrap_or_default();
-            let value = next_arg(tokens, i).unwrap_or_default();
-            SearchKey::Header(name, value)
-        }
+        "HEADER" => match (next_arg(tokens, i), next_arg(tokens, i)) {
+            (Some(name), Some(value)) => SearchKey::Header(name, value),
+            _ => SearchKey::Invalid("HEADER needs a field name and a string".to_owned()),
+        },
 
-        "BEFORE" => date_key(tokens, i, SearchKey::Before),
-        "ON" => date_key(tokens, i, SearchKey::On),
-        "SINCE" => date_key(tokens, i, SearchKey::Since),
-        "SENTBEFORE" => date_key(tokens, i, SearchKey::SentBefore),
-        "SENTON" => date_key(tokens, i, SearchKey::SentOn),
-        "SENTSINCE" => date_key(tokens, i, SearchKey::SentSince),
+        "BEFORE" => date_key(tokens, i, "BEFORE", SearchKey::Before),
+        "ON" => date_key(tokens, i, "ON", SearchKey::On),
+        "SINCE" => date_key(tokens, i, "SINCE", SearchKey::Since),
+        "SENTBEFORE" => date_key(tokens, i, "SENTBEFORE", SearchKey::SentBefore),
+        "SENTON" => date_key(tokens, i, "SENTON", SearchKey::SentOn),
+        "SENTSINCE" => date_key(tokens, i, "SENTSINCE", SearchKey::SentSince),
 
-        "LARGER" => size_key(tokens, i, SearchKey::Larger),
-        "SMALLER" => size_key(tokens, i, SearchKey::Smaller),
+        "LARGER" => size_key(tokens, i, "LARGER", SearchKey::Larger),
+        "SMALLER" => size_key(tokens, i, "SMALLER", SearchKey::Smaller),
 
-        "UID" => {
-            let set = next_arg(tokens, i)
-                .map(|s| parse_seqset(&s))
-                .unwrap_or_default();
-            SearchKey::Uid(set)
-        }
+        "UID" => match next_arg(tokens, i) {
+            Some(set) if is_seqset(&set) => SearchKey::Uid(parse_seqset(&set)),
+            Some(other) => SearchKey::Invalid(format!("UID {} is not a set", echo(&other))),
+            None => SearchKey::Invalid("UID needs a set".to_owned()),
+        },
 
-        // Not a recognised keyword: a bare sequence set, or something we don't
-        // model. A seq-set becomes a Sequence predicate; anything else degrades
-        // to a non-restrictive match so we never hide results.
+        // Not a recognised keyword: a bare sequence set is a criterion of its
+        // own; anything else is a key we do not know.
         _ => {
             if is_seqset(atom) {
                 SearchKey::Sequence(parse_seqset(atom))
             } else {
-                SearchKey::All
+                SearchKey::Invalid(format!("unknown search key {}", echo(atom)))
             }
         }
     }
 }
 
-fn str_key(tokens: &[Token], i: &mut usize, ctor: fn(String) -> SearchKey) -> SearchKey {
-    ctor(next_arg(tokens, i).unwrap_or_default())
-}
-
-fn date_key(tokens: &[Token], i: &mut usize, ctor: fn(i64) -> SearchKey) -> SearchKey {
-    match next_arg(tokens, i).and_then(|s| parse_imap_date(&s)) {
-        Some(day) => ctor(day),
-        None => SearchKey::All,
+fn str_key(
+    tokens: &[Token],
+    i: &mut usize,
+    name: &str,
+    ctor: fn(String) -> SearchKey,
+) -> SearchKey {
+    match next_arg(tokens, i) {
+        Some(text) => ctor(text),
+        None => SearchKey::Invalid(format!("{name} needs a string")),
     }
 }
 
-fn size_key(tokens: &[Token], i: &mut usize, ctor: fn(u64) -> SearchKey) -> SearchKey {
-    match next_arg(tokens, i).and_then(|s| s.parse::<u64>().ok()) {
-        Some(n) => ctor(n),
-        None => SearchKey::All,
+fn date_key(tokens: &[Token], i: &mut usize, name: &str, ctor: fn(i64) -> SearchKey) -> SearchKey {
+    match next_arg(tokens, i) {
+        Some(text) => match parse_imap_date(&text) {
+            Some(day) => ctor(day),
+            None => SearchKey::Invalid(format!(
+                "{name} {} is not a date like 1-Feb-2024",
+                echo(&text)
+            )),
+        },
+        None => SearchKey::Invalid(format!("{name} needs a date")),
+    }
+}
+
+fn size_key(tokens: &[Token], i: &mut usize, name: &str, ctor: fn(u64) -> SearchKey) -> SearchKey {
+    match next_arg(tokens, i) {
+        Some(text) => match text.parse::<u64>() {
+            Ok(n) => ctor(n),
+            Err(_) => SearchKey::Invalid(format!("{name} {} is not a size", echo(&text))),
+        },
+        None => SearchKey::Invalid(format!("{name} needs a size")),
     }
 }
 
@@ -681,8 +724,9 @@ mod tests {
     // --- parser ---
 
     #[test]
-    fn parse_all_when_empty() {
-        assert_eq!(parse(""), SearchKey::All);
+    fn parse_requires_a_criterion() {
+        // RFC 3501: SEARCH takes at least one key.
+        assert!(parse("").invalid_reason().is_some());
         assert_eq!(parse("ALL"), SearchKey::All);
     }
 
@@ -744,8 +788,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_bad_date_degrades_to_all() {
-        assert_eq!(parse("SINCE not-a-date"), SearchKey::All);
+    fn parse_bad_date_is_invalid() {
+        assert!(parse("SINCE not-a-date").invalid_reason().is_some());
     }
 
     #[test]
@@ -755,8 +799,57 @@ mod tests {
     }
 
     #[test]
-    fn parse_unknown_key_is_non_restrictive() {
-        assert_eq!(parse("XFOOBAR"), SearchKey::All);
+    fn parse_unknown_key_is_invalid() {
+        // Matching all would be a silent wrong answer, and under NOT an
+        // empty success (issue #16).
+        assert!(parse("XFOOBAR").invalid_reason().is_some());
+    }
+
+    #[test]
+    fn every_malformed_criterion_is_invalid_even_under_not() {
+        for query in [
+            "NOT FOOBAR",
+            "NOT BEFORE 99-Foo-2020",
+            "NOT SMALLER abc",
+            "LARGER",
+            "UID abc",
+            "UID",
+            "HEADER",
+            "HEADER Subject",
+            "NOT SUBJECT",
+            "NOT \"x\"",
+            "OR SEEN",
+            "NOT",
+            "CHARSET",
+            "CHARSET UTF-8",
+            "(SEEN",
+            "SEEN)",
+            "()",
+            "KEYWORD work FOOBAR",
+        ] {
+            assert!(parse(query).invalid_reason().is_some(), "{query}");
+        }
+        for query in [
+            "SUBJECT \"\"",
+            "HEADER Message-ID \"\"",
+            "CHARSET UTF-8 SUBJECT x",
+            "OR (SEEN) NOT DELETED",
+            "1:5 UID 3:*",
+        ] {
+            assert!(parse(query).invalid_reason().is_none(), "{query}");
+        }
+    }
+
+    #[test]
+    fn invalid_reasons_are_one_7_bit_line() {
+        let reason = parse("KEYWORD \"za\u{17c}\r\nx\"")
+            .invalid_reason()
+            .unwrap()
+            .to_owned();
+        assert!(
+            reason.is_ascii() && !reason.contains(['\r', '\n']),
+            "{reason}"
+        );
     }
 
     // --- seqset ---
