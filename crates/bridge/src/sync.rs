@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -848,6 +848,15 @@ pub(crate) async fn sync_folder(
             folder.imap_path, e
         ),
     }
+
+    // Mail that got its UID while the listing ran (an event, an APPEND) may
+    // be missing from it; dropping it here would EXPUNGE it from clients and
+    // bring it back under the same UID at the next sync. Kept as the DB
+    // cleanup above keeps it.
+    let listed: HashSet<&str> = current_ids.iter().copied().collect();
+    updated.extend(existing_map.into_iter().filter_map(|(eid, mail)| {
+        (mail.uid >= listed_below_uid && !listed.contains(eid.as_str())).then_some(mail)
+    }));
 
     store.set_folder(&folder.id, updated).await;
 

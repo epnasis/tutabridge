@@ -2254,6 +2254,10 @@ mod tests {
         labels: Mutex<Vec<crate::labels::LabelInfo>>,
         fail_details: Mutex<bool>,
         fail_attachments: Mutex<bool>,
+        /// Run once mid-listing, as the event handler would: the mail gets
+        /// a UID and enters memory, but the listing does not show it.
+        #[allow(clippy::type_complexity)]
+        during_listing: Mutex<Option<(Arc<MailStore>, Arc<LocalStore>, Mail)>>,
     }
 
     impl MockBackend {
@@ -2269,6 +2273,7 @@ mod tests {
                 labels: Mutex::new(Vec::new()),
                 fail_details: Mutex::new(false),
                 fail_attachments: Mutex::new(false),
+                during_listing: Mutex::new(None),
             }
         }
 
@@ -2348,6 +2353,49 @@ mod tests {
             rand_core::OsRng,
         )));
         Arc::new(LocalStore::open(&tmp.join("s.db"), &tmp.join("mails"), key).unwrap())
+    }
+
+    #[tokio::test]
+    async fn mail_given_a_uid_during_the_listing_stays_in_memory() {
+        let local_store = temp_local_store();
+        let backend = Arc::new(MockBackend::with_mails(vec![make_mail("e1", "s", true)]));
+        let store = MailStore::new();
+        crate::sync::sync_folder(&store, &local_store, &*backend, &inbox_folder())
+            .await
+            .unwrap();
+        *backend.during_listing.lock().unwrap() = Some((
+            store.clone(),
+            local_store.clone(),
+            make_mail("e2", "new", true),
+        ));
+        crate::sync::sync_folder(&store, &local_store, &*backend, &inbox_folder())
+            .await
+            .unwrap();
+        let mut uids: Vec<u32> = store
+            .get_folder("inbox")
+            .await
+            .iter()
+            .map(|m| m.uid)
+            .collect();
+        uids.sort();
+        // Dropping UID 2 would EXPUNGE it now and reissue it next sync.
+        assert_eq!(uids, [1, 2]);
+        // e1 deleted, e2 now listed, and e3 arrives mid-listing AND is
+        // listed: e1 goes, nothing appears twice.
+        let e3 = make_mail("e3", "newer", true);
+        *backend.mails.lock().unwrap() = vec![make_mail("e2", "new", true), e3.clone()];
+        *backend.during_listing.lock().unwrap() = Some((store.clone(), local_store.clone(), e3));
+        crate::sync::sync_folder(&store, &local_store, &*backend, &inbox_folder())
+            .await
+            .unwrap();
+        let mut uids: Vec<u32> = store
+            .get_folder("inbox")
+            .await
+            .iter()
+            .map(|m| m.uid)
+            .collect();
+        uids.sort();
+        assert_eq!(uids, [2, 3]);
     }
 
     #[tokio::test]
@@ -3355,10 +3403,25 @@ mod tests {
     impl MailBackend for MockBackend {
         async fn load_mail_ids_for_folder(
             &self,
-            _folder: &FolderInfo,
+            folder: &FolderInfo,
             _limit: usize,
         ) -> Result<Vec<Mail>, String> {
-            Ok(self.mails.lock().unwrap().clone())
+            let listing = self.mails.lock().unwrap().clone();
+            let hook = self.during_listing.lock().unwrap().take();
+            if let Some((store, local_store, mail)) = hook {
+                let eid = mail._id.as_ref().unwrap().element_id.to_string();
+                let uids = local_store.assign_folder_uids(&folder.id, &[&eid]).unwrap();
+                let mut held = store.get_folder(&folder.id).await;
+                held.push(StoredMail {
+                    mail,
+                    details: None,
+                    rfc2822: None,
+                    uid: uids[&eid],
+                    attachments_pending: false,
+                });
+                store.set_folder(&folder.id, held).await;
+            }
+            Ok(listing)
         }
         async fn load_mail(
             &self,
