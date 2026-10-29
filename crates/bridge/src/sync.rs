@@ -844,7 +844,9 @@ pub(crate) async fn sync_folder(
         } else {
             // New mail, body not fetched yet — leave `rfc2822` empty so the
             // IMAP layer fetches it on demand (a placeholder would mask that).
-            // A mail new to this folder only (moved in) keeps a pending flag.
+            // A mail new to this folder only (moved in) that still waits for
+            // attachments keeps the flag and its cached body: the retry pass
+            // only takes mails with a body.
             let attachments_pending = elem_id.as_ref().is_some_and(|eid| {
                 local_store
                     .attachments_pending_since(eid)
@@ -852,10 +854,14 @@ pub(crate) async fn sync_folder(
                     .flatten()
                     .is_some()
             });
+            let rfc2822 = match (&elem_id, attachments_pending) {
+                (Some(eid), true) => local_store.read_eml(eid).ok().flatten(),
+                _ => None,
+            };
             updated.push(StoredMail {
                 mail: mail.clone(),
                 details: None,
-                rfc2822: None,
+                rfc2822,
                 uid,
                 attachments_pending,
             });
@@ -1130,6 +1136,9 @@ pub(crate) async fn prefetch_details(
             .attachments_pending_since(&eid)
             .ok()
             .flatten()
+            // A bare 1 is the column's earlier boolean form (unreleased
+            // 93fe631): pending, age unknown — not "since 1970".
+            .filter(|&since| since > 1)
             .and_then(|since| {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

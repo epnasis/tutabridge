@@ -2783,7 +2783,7 @@ mod tests {
         let (_, backend, local_store, store) = on_demand_fetch(true).await;
         // Pending since the epoch: far past the age limit, though this
         // process has not tried it yet.
-        local_store.exec_for_test("UPDATE mails SET attachments_pending = 1");
+        local_store.exec_for_test("UPDATE mails SET attachments_pending = 2");
         let _ = backend;
         crate::sync::prefetch_details(
             &store,
@@ -2799,6 +2799,121 @@ mod tests {
             .attachments_pending_in("inbox")
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_legacy_pending_flag_is_retried_not_given_up() {
+        let (_, backend, local_store, store) = on_demand_fetch(true).await;
+        // The column's earlier boolean form.
+        local_store.exec_for_test("UPDATE mails SET attachments_pending = 1");
+        crate::sync::prefetch_details(
+            &store,
+            &local_store,
+            &*backend,
+            &inbox_folder(),
+            0,
+            &mut std::collections::HashMap::new(),
+        )
+        .await;
+        // Still transient, attempt 1, age unknown: kept pending.
+        assert!(store.get_folder("inbox").await[0].attachments_pending);
+        let _ = backend;
+    }
+
+    #[tokio::test]
+    async fn a_complete_on_demand_fetch_clears_the_flag() {
+        let (_, backend, local_store, store) = on_demand_fetch(true).await;
+        assert!(local_store
+            .attachments_pending_in("inbox")
+            .unwrap()
+            .contains("od"));
+        // Opened again in a new session, this time with every attachment.
+        *backend.fail_attachments.lock().unwrap() = false;
+        let mut cold = store.get_folder("inbox").await[0].clone();
+        cold.details = None;
+        cold.rfc2822 = None;
+        store.set_folder("inbox", vec![cold]).await;
+        let mut session = ImapSession::new(store.clone(), backend, None, Some(local_store.clone()));
+        session.handle_command("a LOGIN u p").await;
+        session.handle_command("b SELECT INBOX").await;
+        session.handle_command("c UID FETCH 1 (BODY.PEEK[])").await;
+        assert!(local_store
+            .attachments_pending_in("inbox")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn the_pending_since_time_keeps_the_earliest() {
+        let local_store = temp_local_store();
+        local_store
+            .upsert_mail_metadata(&crate::sync::mail_to_metadata(
+                &make_mail("e1", "s", true),
+                "inbox",
+                1,
+            ))
+            .unwrap();
+        local_store.set_attachments_pending("e1", true).unwrap();
+        let first = local_store
+            .attachments_pending_since("e1")
+            .unwrap()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        local_store.set_attachments_pending("e1", true).unwrap();
+        assert_eq!(
+            local_store.attachments_pending_since("e1").unwrap(),
+            Some(first)
+        );
+        local_store.set_attachments_pending("e1", false).unwrap();
+        assert_eq!(local_store.attachments_pending_since("e1").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_pending_mail_moved_in_by_a_sync_is_retried() {
+        let (_, backend, local_store, store) = on_demand_fetch(true).await;
+        // A sync finds it in the folder anew: memory had lost it.
+        store.set_folder("inbox", vec![]).await;
+        crate::sync::sync_folder(&store, &local_store, &*backend, &inbox_folder())
+            .await
+            .unwrap();
+        *backend.fail_attachments.lock().unwrap() = false;
+        crate::sync::prefetch_details(
+            &store,
+            &local_store,
+            &*backend,
+            &inbox_folder(),
+            0,
+            &mut std::collections::HashMap::new(),
+        )
+        .await;
+        assert!(local_store
+            .attachments_pending_in("inbox")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_retry_without_details_ends_the_pending_state() {
+        let (_, backend, local_store, store) = on_demand_fetch(true).await;
+        // After a restart: no details in memory, and the server has none.
+        let mut cold = store.get_folder("inbox").await[0].clone();
+        cold.details = None;
+        store.set_folder("inbox", vec![cold]).await;
+        backend.details.lock().unwrap().clear();
+        crate::sync::prefetch_details(
+            &store,
+            &local_store,
+            &*backend,
+            &inbox_folder(),
+            0,
+            &mut std::collections::HashMap::new(),
+        )
+        .await;
+        assert!(local_store
+            .attachments_pending_in("inbox")
+            .unwrap()
+            .is_empty());
+        assert!(!store.get_folder("inbox").await[0].attachments_pending);
     }
 
     #[tokio::test]
