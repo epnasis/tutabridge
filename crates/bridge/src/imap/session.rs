@@ -9,6 +9,7 @@ use crate::mail::{mail_to_rfc2822, strip_html};
 use crate::store::LocalStore;
 use crate::sync::MailStore;
 use crate::tuta::{FolderInfo, MailBackend};
+use tutasdk::folder_system::MailSetKind;
 
 #[derive(Debug, Clone, PartialEq)]
 enum State {
@@ -273,12 +274,50 @@ impl ImapSession {
     /// connection loop), which is what lets a client's "save to Sent" succeed
     /// without creating a duplicate.
     pub(crate) async fn append_targets_sent(&self, mailbox: &str) -> bool {
+        matches!(self.append_target(mailbox).await, AppendTarget::Sent)
+    }
+
+    pub(crate) async fn append_target(&self, mailbox: &str) -> AppendTarget {
         let name = super::utf7::decode(mailbox).unwrap_or_else(|| mailbox.to_string());
-        self.store
-            .folder_by_imap_path(&name)
-            .await
-            .map(|f| f.special_use.as_deref() == Some("\\Sent"))
-            .unwrap_or(false)
+        match self.store.folder_by_imap_path(&name).await {
+            Some(f) if f.kind == MailSetKind::Sent => AppendTarget::Sent,
+            Some(f) if f.kind == MailSetKind::Draft => AppendTarget::Drafts(f),
+            _ => AppendTarget::Other,
+        }
+    }
+
+    /// APPEND to Drafts: the message becomes a Tuta draft. Its UID is assigned
+    /// now, from the same persisted map the event handler uses when the draft
+    /// shows up in Drafts, so `APPENDUID` (RFC 4315, UIDPLUS is advertised)
+    /// names the UID the client will see. Returns the tagged response line.
+    pub(crate) async fn append_draft(&self, tag: &str, drafts: &FolderInfo, raw: &[u8]) -> String {
+        let parsed = crate::mail::parser::parse_rfc2822(&String::from_utf8_lossy(raw));
+        let mail_id = match self.backend.save_draft(&parsed).await {
+            Ok(id) => id,
+            Err(e) => {
+                warn!("APPEND to Drafts failed: {e}");
+                return format!(
+                    "{tag} NO APPEND failed: the draft was not saved (see the bridge log)\r\n"
+                );
+            }
+        };
+        let Some(local_store) = &self.local_store else {
+            return format!("{tag} OK APPEND completed\r\n");
+        };
+        let element_id = mail_id.element_id.to_string();
+        let assigned = local_store
+            .folder_uid_state(&drafts.id)
+            .and_then(|(validity, _)| {
+                let uids = local_store.assign_folder_uids(&drafts.id, &[element_id.as_str()])?;
+                Ok((validity, uids.get(&element_id).copied()))
+            });
+        match assigned {
+            Ok((validity, Some(uid))) => {
+                format!("{tag} OK [APPENDUID {validity} {uid}] APPEND completed\r\n")
+            }
+            // Saved; only the UID is unknown, which RFC 4315 permits.
+            _ => format!("{tag} OK APPEND completed\r\n"),
+        }
     }
 
     fn cmd_capability(&self, tag: &str) -> Vec<String> {
@@ -1563,6 +1602,19 @@ pub(crate) struct AppendRequest {
     pub tag: String,
     pub mailbox: String,
     pub literal_size: usize,
+    /// `{N+}`: the client sends the bytes without waiting for `+`, so they
+    /// must be read even when the APPEND is refused.
+    pub non_sync: bool,
+}
+
+/// Where an APPEND lands.
+pub(crate) enum AppendTarget {
+    /// Tuta keeps sent mail itself: accepted as a no-op.
+    Sent,
+    /// Saved as a Tuta draft.
+    Drafts(FolderInfo),
+    /// Not supported.
+    Other,
 }
 
 /// Parse an `APPEND` command line. Returns `None` if it is not a well-formed
@@ -1573,25 +1625,18 @@ pub(crate) fn parse_append(line: &str) -> Option<AppendRequest> {
     if !cmd.eq_ignore_ascii_case("APPEND") {
         return None;
     }
-    let mailbox = append_first_token(&args)?;
+    let (mailbox, _) = parse_imap_token(args.trim_start());
+    if mailbox.is_empty() {
+        return None;
+    }
     let literal_size = append_literal_size(&args)?;
+    let non_sync = args.trim_end().ends_with("+}");
     Some(AppendRequest {
         tag,
         mailbox,
         literal_size,
+        non_sync,
     })
-}
-
-/// The first argument token of an APPEND (the mailbox), honoring quoting.
-fn append_first_token(args: &str) -> Option<String> {
-    let s = args.trim_start();
-    if let Some(rest) = s.strip_prefix('"') {
-        let end = rest.find('"')?;
-        Some(rest[..end].to_string())
-    } else {
-        let end = s.find(char::is_whitespace).unwrap_or(s.len());
-        (end > 0).then(|| s[..end].to_string())
-    }
 }
 
 /// The size declared by the trailing `{N}` (or non-sync `{N+}`) literal.
