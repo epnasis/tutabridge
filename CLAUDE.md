@@ -13,7 +13,7 @@ Tuta API  ←──  Syncer (background)  ──→  MailStore (in-memory)  ←�
 
 - The **syncer** (`sync.rs`) runs independently in a background tokio task. It pulls emails from the Tuta API and populates the `MailStore`.
 - The **IMAP server** (`imap/`) ONLY reads from the `MailStore`. It NEVER makes API calls for reads.
-- The only IMAP→network calls are **mutations**: marking read/unread (`STORE \Seen`), trashing (`EXPUNGE`), moving (`MOVE`), and label operations (`STORE` with keywords — apply/remove/create, see below).
+- The only IMAP→network calls are **mutations**: marking read/unread (`STORE \Seen`), trashing (`EXPUNGE`), moving (`MOVE`), label operations (`STORE` with keywords — apply/remove/create, see below), and folder `CREATE`/`RENAME`/`DELETE` (see below). Folder mutations re-read the folder list from the server afterwards instead of waiting for the syncer.
 
 ### Synthesized messages carry provenance headers only
 
@@ -150,6 +150,29 @@ Tuta labels (`MailSet`s with `kind == Label`) are exposed as IMAP keywords
   encrypted values (e.g. a label without a color) decrypt to their
   defaults — an SDK fix; both SDK commits live on the submodule branch
   `sdk-label-fixes` (epnasis/tutanota) until upstreamed.
+
+### Folder CREATE / RENAME / DELETE
+
+Custom folders map to `MailFolderService` (POST create, PUT move, DELETE)
+and a MailSet `update_instance` for a rename. The rules mirror Tuta's own
+web client:
+
+- **DELETE** of a folder outside Trash/Spam moves it into Trash; an empty
+  folder (and empty descendants, deepest first) is deleted outright, since
+  Trash does not take empty folders (UNVERIFIED live). Inside Trash/Spam,
+  DELETE deletes for good. `RENAME X Trash/...` (Thunderbird's delete) is
+  the same operation.
+- **No two siblings of one name.** Tuta allows them, IMAP cannot address
+  them. A folder arriving where its name is taken gets `Name (2)`, …. Into
+  Trash: if its own name is free there it moves first, then renames; if
+  not, it renames first to a name free in both places. Either way a
+  failure between the two calls cannot leave a duplicate.
+- **Exact names** (`folder_by_exact_path`) for existence checks — `Work`
+  → `work` is a rename. Lookups for SELECT etc. still fold case.
+- **Partial failure** answers `NO … earlier steps may have completed, LIST
+  shows the result`, re-reads the list and deselects a folder that is gone.
+- Emptiness reads ascending from `CustomId::default()`, as the web client
+  does. Nothing here has run against a live account yet.
 
 ### Syncer two-phase cycle
 
