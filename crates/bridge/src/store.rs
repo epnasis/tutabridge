@@ -304,6 +304,27 @@ impl LocalStore {
         Ok(removed)
     }
 
+    /// Folders a client unsubscribed from (IMAP UNSUBSCRIBE). Kept as the
+    /// exceptions because every folder starts subscribed: a new Tuta folder
+    /// must show up in LSUB without a client having to subscribe to it.
+    pub fn unsubscribed_folders(&self) -> std::collections::HashSet<String> {
+        self.get_meta("unsubscribed_folders")
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn set_subscribed(&self, folder_id: &str, subscribed: bool) -> Result<(), StoreError> {
+        let mut unsubscribed = self.unsubscribed_folders();
+        if subscribed {
+            unsubscribed.remove(folder_id);
+        } else {
+            unsubscribed.insert(folder_id.to_owned());
+        }
+        let mut ids: Vec<&String> = unsubscribed.iter().collect();
+        ids.sort();
+        self.set_meta("unsubscribed_folders", &serde_json::to_string(&ids)?)
+    }
+
     pub fn verify_key(&self) -> bool {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
