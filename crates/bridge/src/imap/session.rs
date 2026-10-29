@@ -9,6 +9,7 @@ use crate::mail::{mail_to_rfc2822, strip_html};
 use crate::store::LocalStore;
 use crate::sync::MailStore;
 use crate::tuta::{FolderInfo, MailBackend};
+use tutasdk::folder_system::MailSetKind;
 
 #[derive(Debug, Clone, PartialEq)]
 enum State {
@@ -253,11 +254,9 @@ impl ImapSession {
             "STORE" => self.cmd_store(&tag, &args, false).await,
             "MOVE" => self.cmd_move(&tag, &args, false).await,
             "COPY" => self.cmd_copy(&tag),
-            "CREATE" | "DELETE" | "RENAME" => vec![format!(
-                "{} NO [CANNOT] {} is not supported: manage folders in Tuta; MOVE to existing folders (Trash, Archive, ...) works\r\n",
-                tag,
-                cmd.to_uppercase()
-            )],
+            "CREATE" => self.cmd_create(&tag, &args).await,
+            "DELETE" => self.cmd_delete(&tag, &args).await,
+            "RENAME" => self.cmd_rename(&tag, &args).await,
             "IDLE" => {
                 self.idle_tag = Some(tag.clone());
                 vec!["+ idling\r\n".to_string()]
@@ -357,6 +356,288 @@ impl ImapSession {
         }
         responses.push(format!("{tag} OK {name} completed\r\n"));
         responses
+    }
+
+    /// Re-read the folder tree from the server, so the session and every other
+    /// connection see a CREATE/RENAME/DELETE at once rather than at the next
+    /// MailSet event.
+    async fn refresh_folders(&self) -> Result<(), String> {
+        let folders = self.backend.list_folders().await?;
+        self.store.set_folder_list(folders).await;
+        Ok(())
+    }
+
+    /// A failed folder operation: logged in full, answered with a fixed text
+    /// (server errors are not client-safe response text).
+    fn folder_failure(tag: &str, cmd: &str, name: &str, error: &str) -> Vec<String> {
+        warn!("{cmd} {name:?} failed: {error}");
+        vec![format!("{tag} NO {cmd} failed (see the bridge log)\r\n")]
+    }
+
+    /// A mailbox name from a command argument: decoded, without the trailing
+    /// delimiter some clients add, and `None` when it is not a usable name.
+    fn mailbox_name(arg: &str) -> Option<String> {
+        let name = super::utf7::decode(arg).unwrap_or_else(|| arg.to_string());
+        let name = name.trim_end_matches('/').to_string();
+        (!name.is_empty() && name.split('/').all(|segment| !segment.is_empty())).then_some(name)
+    }
+
+    async fn subtree(&self, path: &str) -> Vec<FolderInfo> {
+        let prefix = format!("{path}/");
+        self.store
+            .list_folders()
+            .await
+            .into_iter()
+            .filter(|f| f.imap_path.starts_with(&prefix))
+            .collect()
+    }
+
+    async fn in_trash_or_spam(&self, path: &str) -> bool {
+        for folder in self.store.list_folders().await {
+            if matches!(folder.kind, MailSetKind::Trash | MailSetKind::Spam)
+                && (path == folder.imap_path || path.starts_with(&format!("{}/", folder.imap_path)))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Tuta's "delete folder" outside Trash/Spam (web client
+    /// `trashFolderAndSubfolders`): empty subfolders are deleted deepest
+    /// first, then the folder itself if it is empty with nothing left under
+    /// it; otherwise it moves under Trash, recoverable. Trash/Spam refuse
+    /// empty folders, which is why empties are deleted instead of moved.
+    /// Returns whether the folder still exists (now under `target`).
+    async fn trash_or_delete(
+        &self,
+        folder: &FolderInfo,
+        target: &FolderInfo,
+    ) -> Result<bool, String> {
+        let mut descendants = self.subtree(&folder.imap_path).await;
+        descendants.sort_by_key(|f| std::cmp::Reverse(f.imap_path.matches('/').count()));
+        let mut deleted: Vec<String> = Vec::new();
+        for descendant in &descendants {
+            let children_gone = self
+                .subtree(&descendant.imap_path)
+                .await
+                .iter()
+                .all(|child| deleted.contains(&child.imap_path));
+            if children_gone && self.backend.folder_is_empty(descendant).await? {
+                self.backend.delete_folder(descendant).await?;
+                deleted.push(descendant.imap_path.clone());
+            }
+        }
+        let all_children_gone = descendants.iter().all(|d| deleted.contains(&d.imap_path));
+        if all_children_gone && self.backend.folder_is_empty(folder).await? {
+            self.backend.delete_folder(folder).await?;
+            return Ok(false);
+        }
+        self.backend.move_folder(folder, Some(target)).await?;
+        Ok(true)
+    }
+
+    /// CREATE, with any missing parent created first (RFC 3501 §6.3.3).
+    async fn cmd_create(&mut self, tag: &str, args: &str) -> Vec<String> {
+        if self.state == State::NotAuthenticated {
+            return vec![format!("{tag} NO Not authenticated\r\n")];
+        }
+        let (raw_name, _) = parse_imap_token(args.trim());
+        let Some(name) = Self::mailbox_name(&raw_name) else {
+            return vec![format!("{tag} BAD CREATE needs a mailbox name\r\n")];
+        };
+        if self.store.folder_by_imap_path(&name).await.is_some() {
+            return vec![format!(
+                "{tag} NO [ALREADYEXISTS] Mailbox already exists\r\n"
+            )];
+        }
+        let segments: Vec<&str> = name.split('/').collect();
+        let mut parent: Option<FolderInfo> = None;
+        for depth in 0..segments.len() {
+            let path = segments[..=depth].join("/");
+            if let Some(existing) = self.store.folder_by_imap_path(&path).await {
+                parent = Some(existing);
+                continue;
+            }
+            if let Err(e) = self
+                .backend
+                .create_folder(segments[depth], parent.as_ref())
+                .await
+            {
+                return Self::folder_failure(tag, "CREATE", &path, &e);
+            }
+            if let Err(e) = self.refresh_folders().await {
+                return Self::folder_failure(tag, "CREATE", &path, &e);
+            }
+            match self.store.folder_by_imap_path(&path).await {
+                Some(created) => parent = Some(created),
+                None => {
+                    return Self::folder_failure(
+                        tag,
+                        "CREATE",
+                        &path,
+                        "created, but not in the folder list that followed",
+                    )
+                }
+            }
+        }
+        vec![format!("{tag} OK CREATE completed\r\n")]
+    }
+
+    /// DELETE as Tuta's own client deletes a folder: for good inside Trash
+    /// or Spam (mail included, as RFC 3501 DELETE means), otherwise into
+    /// Trash unless empty (see `trash_or_delete`).
+    async fn cmd_delete(&mut self, tag: &str, args: &str) -> Vec<String> {
+        if self.state == State::NotAuthenticated {
+            return vec![format!("{tag} NO Not authenticated\r\n")];
+        }
+        let (raw_name, _) = parse_imap_token(args.trim());
+        let Some(name) = Self::mailbox_name(&raw_name) else {
+            return vec![format!("{tag} BAD DELETE needs a mailbox name\r\n")];
+        };
+        let Some(folder) = self.store.folder_by_imap_path(&name).await else {
+            return vec![format!("{tag} NO [NONEXISTENT] Mailbox does not exist\r\n")];
+        };
+        if folder.kind != MailSetKind::Custom {
+            return vec![format!(
+                "{tag} NO [CANNOT] system folders cannot be deleted\r\n"
+            )];
+        }
+        let result = if self.in_trash_or_spam(&folder.imap_path).await {
+            self.backend
+                .delete_folder(&folder)
+                .await
+                .map(|()| "deleted")
+        } else {
+            let trash = self
+                .store
+                .list_folders()
+                .await
+                .into_iter()
+                .find(|f| f.kind == MailSetKind::Trash);
+            match trash {
+                Some(trash) => self.trash_or_delete(&folder, &trash).await.map(|kept| {
+                    if kept {
+                        "moved to Trash"
+                    } else {
+                        "deleted"
+                    }
+                }),
+                None => Err("no Trash folder to move it to".to_owned()),
+            }
+        };
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(e) => return Self::folder_failure(tag, "DELETE", &name, &e),
+        };
+        if let Err(e) = self.refresh_folders().await {
+            return Self::folder_failure(tag, "DELETE", &name, &e);
+        }
+        if self.selected_folder.as_ref().map(|f| &f.id) == Some(&folder.id) {
+            self.selected_folder = None;
+            self.state = State::Authenticated;
+        }
+        vec![format!("{tag} OK DELETE completed ({outcome})\r\n")]
+    }
+
+    /// RENAME: a new parent moves the folder (subfolders with it), a new last
+    /// segment renames it. Into Trash or Spam it is a delete as Tuta does
+    /// one (Thunderbird deletes folders this way).
+    async fn cmd_rename(&mut self, tag: &str, args: &str) -> Vec<String> {
+        if self.state == State::NotAuthenticated {
+            return vec![format!("{tag} NO Not authenticated\r\n")];
+        }
+        let (raw_old, rest) = parse_imap_token(args.trim());
+        let (raw_new, _) = parse_imap_token(rest.trim_start());
+        let (Some(old_name), Some(new_name)) =
+            (Self::mailbox_name(&raw_old), Self::mailbox_name(&raw_new))
+        else {
+            return vec![format!("{tag} BAD RENAME needs two mailbox names\r\n")];
+        };
+        let Some(folder) = self.store.folder_by_imap_path(&old_name).await else {
+            return vec![format!("{tag} NO [NONEXISTENT] Mailbox does not exist\r\n")];
+        };
+        if folder.kind != MailSetKind::Custom {
+            return vec![format!(
+                "{tag} NO [CANNOT] system folders cannot be renamed\r\n"
+            )];
+        }
+        if self.store.folder_by_imap_path(&new_name).await.is_some() {
+            return vec![format!(
+                "{tag} NO [ALREADYEXISTS] Mailbox already exists\r\n"
+            )];
+        }
+        if new_name.starts_with(&format!("{}/", folder.imap_path)) {
+            return vec![format!(
+                "{tag} NO [CANNOT] a folder cannot move into itself\r\n"
+            )];
+        }
+        let (new_parent_path, new_leaf) = match new_name.rsplit_once('/') {
+            Some((parent, leaf)) => (Some(parent.to_string()), leaf.to_string()),
+            None => (None, new_name.clone()),
+        };
+        let new_parent = match &new_parent_path {
+            Some(path) => match self.store.folder_by_imap_path(path).await {
+                Some(parent) => Some(parent),
+                None => {
+                    return vec![format!(
+                        "{tag} NO [NONEXISTENT] the new parent does not exist; CREATE it first\r\n"
+                    )]
+                }
+            },
+            None => None,
+        };
+        let old_parent_path = folder
+            .imap_path
+            .rsplit_once('/')
+            .map(|(p, _)| p.to_string());
+
+        let result: Result<(), String> = async {
+            let mut still_there = true;
+            if old_parent_path != new_parent_path {
+                match &new_parent {
+                    Some(parent) if self.in_trash_or_spam(&parent.imap_path).await => {
+                        still_there = self.trash_or_delete(&folder, parent).await?;
+                    }
+                    parent => self.backend.move_folder(&folder, parent.as_ref()).await?,
+                }
+            }
+            let old_leaf = folder.imap_path.rsplit('/').next().unwrap_or_default();
+            if still_there && old_leaf != new_leaf {
+                // Rename what the move left, not the record from before it.
+                self.refresh_folders().await?;
+                let moved = self
+                    .store
+                    .list_folders()
+                    .await
+                    .into_iter()
+                    .find(|f| f.id == folder.id)
+                    .ok_or("the folder vanished during RENAME")?;
+                self.backend.rename_folder(&moved, &new_leaf).await?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
+            return Self::folder_failure(tag, "RENAME", &old_name, &e);
+        }
+        if let Err(e) = self.refresh_folders().await {
+            return Self::folder_failure(tag, "RENAME", &old_name, &e);
+        }
+        if self.selected_folder.as_ref().map(|f| &f.id) == Some(&folder.id) {
+            // By id: the folder may now be elsewhere, or (an empty one moved
+            // to Trash) gone.
+            self.selected_folder = self
+                .store
+                .list_folders()
+                .await
+                .into_iter()
+                .find(|f| f.id == folder.id);
+            if self.selected_folder.is_none() {
+                self.state = State::Authenticated;
+            }
+        }
+        vec![format!("{tag} OK RENAME completed\r\n")]
     }
 
     /// SUBSCRIBE / UNSUBSCRIBE. Persisted, so LSUB answers what the client
@@ -2287,6 +2568,12 @@ mod tests {
         labels: Mutex<Vec<crate::labels::LabelInfo>>,
         fail_details: Mutex<bool>,
         fail_attachments: Mutex<bool>,
+        /// Server-side folder tree; folder operations edit it.
+        folders: Mutex<Vec<FolderInfo>>,
+        /// Ids of folders that hold mail (`folder_is_empty` answers false).
+        nonempty: Mutex<std::collections::HashSet<String>>,
+        /// Folder operations in call order, e.g. `move Work -> Trash`.
+        folder_ops: Mutex<Vec<String>>,
     }
 
     impl MockBackend {
@@ -2302,6 +2589,21 @@ mod tests {
                 labels: Mutex::new(Vec::new()),
                 fail_details: Mutex::new(false),
                 fail_attachments: Mutex::new(false),
+                folders: Mutex::new(vec![inbox_folder()]),
+                nonempty: Mutex::new(std::collections::HashSet::new()),
+                folder_ops: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Re-root `folder` and everything under it at `new_path`.
+        fn repath(&self, folder: &FolderInfo, new_path: &str) {
+            let old = folder.imap_path.clone();
+            for f in self.folders.lock().unwrap().iter_mut() {
+                if f.imap_path == old {
+                    f.imap_path = new_path.to_string();
+                } else if let Some(rest) = f.imap_path.strip_prefix(&format!("{old}/")) {
+                    f.imap_path = format!("{new_path}/{rest}");
+                }
             }
         }
 
@@ -2642,16 +2944,201 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn folder_management_answers_no_not_bad() {
+    async fn copy_still_answers_no_not_bad() {
+        // A Tuta mail lives in exactly one folder.
         let backend = Arc::new(MockBackend::with_mails(vec![]));
         let (_, mut session) = make_session(backend).await;
         session.handle_command("a LOGIN u p").await;
-        for cmd in ["CREATE Archive2", "DELETE Work", "RENAME Work Play"] {
-            let resp = session.handle_command(&format!("t {cmd}")).await;
-            assert!(resp[0].starts_with("t NO [CANNOT]"), "{cmd}: {resp:?}");
-        }
         let resp = session.handle_command("t COPY 1 Trash").await;
         assert!(resp[0].starts_with("t NO [CANNOT]"), "{resp:?}");
+    }
+
+    /// A session over a mock server holding INBOX, Trash and Archive.
+    async fn folder_session() -> (Arc<MockBackend>, Arc<MailStore>, ImapSession) {
+        use crate::tuta::{system_imap_name, system_special_use};
+        let system = |id: &str, kind: MailSetKind| FolderInfo {
+            id: id.to_string(),
+            list_id: "folders".to_string(),
+            entries_list_id: format!("{id}_entries"),
+            kind,
+            imap_path: system_imap_name(kind).unwrap().to_string(),
+            special_use: system_special_use(kind).map(str::to_string),
+        };
+        let backend = Arc::new(MockBackend::with_mails(vec![]));
+        *backend.folders.lock().unwrap() = vec![
+            inbox_folder(),
+            system("trash", MailSetKind::Trash),
+            system("archive", MailSetKind::Archive),
+        ];
+        let store = MailStore::new();
+        store
+            .set_folder_list(backend.folders.lock().unwrap().clone())
+            .await;
+        let mut session = ImapSession::new(store.clone(), backend.clone(), None, None);
+        session.handle_command("a LOGIN u p").await;
+        (backend, store, session)
+    }
+
+    fn ops(backend: &MockBackend) -> Vec<String> {
+        std::mem::take(&mut *backend.folder_ops.lock().unwrap())
+    }
+
+    async fn paths(store: &MailStore) -> Vec<String> {
+        let mut p: Vec<String> = store
+            .list_folders()
+            .await
+            .into_iter()
+            .map(|f| f.imap_path)
+            .collect();
+        p.sort();
+        p
+    }
+
+    async fn id_of(store: &MailStore, path: &str) -> String {
+        store.folder_by_imap_path(path).await.unwrap().id
+    }
+
+    #[tokio::test]
+    async fn create_makes_missing_parents_and_refuses_existing_names() {
+        let (backend, store, mut session) = folder_session().await;
+        let resp = session.handle_command("b CREATE Work/Projects/2026").await;
+        assert_eq!(resp, ["b OK CREATE completed\r\n"]);
+        assert_eq!(
+            ops(&backend),
+            [
+                "create Work",
+                "create Work/Projects",
+                "create Work/Projects/2026"
+            ]
+        );
+        assert!(paths(&store)
+            .await
+            .contains(&"Work/Projects/2026".to_string()));
+        // Seen by LIST at once, not at the next MailSet event.
+        let resp = session.handle_command("c LIST \"\" Work/%").await;
+        assert!(resp[0].contains("\"Work/Projects\""), "{resp:?}");
+
+        let resp = session.handle_command("d CREATE Work/Notes/").await;
+        assert_eq!(
+            resp,
+            ["d OK CREATE completed\r\n"],
+            "trailing delimiter is dropped"
+        );
+        assert_eq!(ops(&backend), ["create Work/Notes"]);
+
+        for (cmd, answer) in [
+            ("CREATE Work", "NO [ALREADYEXISTS]"),
+            ("CREATE inbox", "NO [ALREADYEXISTS]"),
+            ("CREATE \"\"", "BAD"),
+            ("CREATE a//b", "BAD"),
+        ] {
+            let resp = session.handle_command(&format!("t {cmd}")).await;
+            assert!(
+                resp[0].starts_with(&format!("t {answer}")),
+                "{cmd}: {resp:?}"
+            );
+        }
+        assert!(ops(&backend).is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_does_what_tutas_own_client_does() {
+        let (backend, store, mut session) = folder_session().await;
+        session.handle_command("b CREATE Empty").await;
+        session.handle_command("c CREATE Full/EmptyChild").await;
+        session.handle_command("d CREATE Full/FullChild").await;
+        ops(&backend);
+        let full = id_of(&store, "Full").await;
+        let full_child = id_of(&store, "Full/FullChild").await;
+        backend.nonempty.lock().unwrap().extend([full, full_child]);
+
+        // Empty: gone for good (Trash refuses empty folders).
+        let resp = session.handle_command("e DELETE Empty").await;
+        assert_eq!(resp, ["e OK DELETE completed (deleted)\r\n"]);
+        assert_eq!(ops(&backend), ["delete Empty"]);
+
+        // Holding mail: empty subfolders deleted, the rest moved to Trash.
+        let resp = session.handle_command("f DELETE Full").await;
+        assert_eq!(resp, ["f OK DELETE completed (moved to Trash)\r\n"]);
+        assert_eq!(
+            ops(&backend),
+            ["delete Full/EmptyChild", "move Full -> Trash"]
+        );
+        assert!(paths(&store)
+            .await
+            .contains(&"Trash/Full/FullChild".to_string()));
+
+        // Inside Trash: deleted for good, mail included (RFC 3501 DELETE).
+        let resp = session.handle_command("g DELETE Trash/Full").await;
+        assert_eq!(resp, ["g OK DELETE completed (deleted)\r\n"]);
+        assert_eq!(ops(&backend), ["delete Trash/Full"]);
+
+        for (cmd, answer) in [
+            ("DELETE Trash", "NO [CANNOT]"),
+            ("DELETE INBOX", "NO [CANNOT]"),
+            ("DELETE Nope", "NO [NONEXISTENT]"),
+        ] {
+            let resp = session.handle_command(&format!("t {cmd}")).await;
+            assert!(
+                resp[0].starts_with(&format!("t {answer}")),
+                "{cmd}: {resp:?}"
+            );
+        }
+        assert!(ops(&backend).is_empty());
+    }
+
+    #[tokio::test]
+    async fn rename_moves_renames_and_deletes_into_trash() {
+        let (backend, store, mut session) = folder_session().await;
+        session.handle_command("b CREATE Work/Sub").await;
+        session.handle_command("c CREATE Old").await;
+        ops(&backend);
+        let work = id_of(&store, "Work").await;
+        backend.nonempty.lock().unwrap().insert(work.clone());
+
+        let resp = session.handle_command("d RENAME Work Play").await;
+        assert_eq!(resp, ["d OK RENAME completed\r\n"]);
+        assert_eq!(ops(&backend), ["rename Work -> Play"]);
+        assert!(paths(&store).await.contains(&"Play/Sub".to_string()));
+
+        let resp = session.handle_command("e RENAME Play Archive/Done").await;
+        assert_eq!(resp, ["e OK RENAME completed\r\n"]);
+        assert_eq!(
+            ops(&backend),
+            ["move Play -> Archive", "rename Archive/Play -> Done"]
+        );
+
+        // Thunderbird deletes a folder by renaming it into Trash.
+        let resp = session
+            .handle_command("f RENAME Archive/Done Trash/Done")
+            .await;
+        assert_eq!(resp, ["f OK RENAME completed\r\n"]);
+        assert_eq!(
+            ops(&backend),
+            ["delete Archive/Done/Sub", "move Archive/Done -> Trash"]
+        );
+        // An empty one cannot go into Trash; it is deleted instead.
+        let resp = session.handle_command("g RENAME Old Trash/Old").await;
+        assert_eq!(resp, ["g OK RENAME completed\r\n"]);
+        assert_eq!(ops(&backend), ["delete Old"]);
+
+        session.handle_command("h CREATE A/B").await;
+        ops(&backend);
+        for (cmd, answer) in [
+            ("RENAME A A/B/C", "NO [CANNOT]"),
+            ("RENAME A Trash/Done", "NO [ALREADYEXISTS]"),
+            ("RENAME INBOX Mine", "NO [CANNOT]"),
+            ("RENAME A Nope/A", "NO [NONEXISTENT]"),
+            ("RENAME Nope X", "NO [NONEXISTENT]"),
+            ("RENAME A", "BAD"),
+        ] {
+            let resp = session.handle_command(&format!("t {cmd}")).await;
+            assert!(
+                resp[0].starts_with(&format!("t {answer}")),
+                "{cmd}: {resp:?}"
+            );
+        }
+        assert!(ops(&backend).is_empty());
     }
 
     #[test]
@@ -3556,7 +4043,85 @@ mod tests {
             Ok(Vec::new())
         }
         async fn list_folders(&self) -> Result<Vec<FolderInfo>, String> {
-            Ok(vec![inbox_folder()])
+            Ok(self.folders.lock().unwrap().clone())
+        }
+        async fn create_folder(
+            &self,
+            name: &str,
+            parent: Option<&FolderInfo>,
+        ) -> Result<(), String> {
+            let path = match parent {
+                Some(p) => format!("{}/{name}", p.imap_path),
+                None => name.to_string(),
+            };
+            self.folder_ops
+                .lock()
+                .unwrap()
+                .push(format!("create {path}"));
+            let mut folders = self.folders.lock().unwrap();
+            let id = format!("f{}", folders.len());
+            folders.push(FolderInfo {
+                id: id.clone(),
+                list_id: "folders".to_string(),
+                entries_list_id: format!("{id}_entries"),
+                kind: MailSetKind::Custom,
+                imap_path: path,
+                special_use: None,
+            });
+            Ok(())
+        }
+        async fn rename_folder(&self, folder: &FolderInfo, name: &str) -> Result<(), String> {
+            let new_path = match folder.imap_path.rsplit_once('/') {
+                Some((parent, _)) => format!("{parent}/{name}"),
+                None => name.to_string(),
+            };
+            self.folder_ops
+                .lock()
+                .unwrap()
+                .push(format!("rename {} -> {name}", folder.imap_path));
+            self.repath(folder, &new_path);
+            Ok(())
+        }
+        async fn move_folder(
+            &self,
+            folder: &FolderInfo,
+            parent: Option<&FolderInfo>,
+        ) -> Result<(), String> {
+            let current = self
+                .folders
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|f| f.id == folder.id)
+                .cloned()
+                .ok_or("no such folder")?;
+            let leaf = current.imap_path.rsplit('/').next().unwrap().to_string();
+            let new_path = match parent {
+                Some(p) => format!("{}/{leaf}", p.imap_path),
+                None => leaf,
+            };
+            self.folder_ops.lock().unwrap().push(format!(
+                "move {} -> {}",
+                current.imap_path,
+                parent.map_or("/", |p| p.imap_path.as_str())
+            ));
+            self.repath(&current, &new_path);
+            Ok(())
+        }
+        async fn delete_folder(&self, folder: &FolderInfo) -> Result<(), String> {
+            self.folder_ops
+                .lock()
+                .unwrap()
+                .push(format!("delete {}", folder.imap_path));
+            let prefix = format!("{}/", folder.imap_path);
+            self.folders
+                .lock()
+                .unwrap()
+                .retain(|f| f.id != folder.id && !f.imap_path.starts_with(&prefix));
+            Ok(())
+        }
+        async fn folder_is_empty(&self, folder: &FolderInfo) -> Result<bool, String> {
+            Ok(!self.nonempty.lock().unwrap().contains(&folder.id))
         }
         async fn list_labels(&self) -> Result<Vec<crate::labels::LabelInfo>, String> {
             // Sessions read labels from the MailStore registry, never from

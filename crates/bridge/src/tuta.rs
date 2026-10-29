@@ -11,14 +11,14 @@ use tutasdk::blobs::blob_facade::FileData;
 use tutasdk::crypto_entity_client::CryptoEntityClient;
 use tutasdk::entities::generated::sys::BlobReferenceTokenWrapper;
 use tutasdk::entities::generated::tutanota::{
-    ApplyLabelServicePostIn, AttachmentKeyData, DraftAttachment, DraftCreateData, DraftData,
-    DraftRecipient, Mail, MailBox, MailDetails, MailDetailsBlob, MailSet, MailSetEntry,
-    ManageLabelServiceLabelData, ManageLabelServicePostIn, NewDraftAttachment, SendDraftData,
-    SendDraftParameters, TutanotaFile,
+    ApplyLabelServicePostIn, AttachmentKeyData, CreateMailFolderData, DeleteMailFolderData,
+    DraftAttachment, DraftCreateData, DraftData, DraftRecipient, Mail, MailBox, MailDetails,
+    MailDetailsBlob, MailSet, MailSetEntry, ManageLabelServiceLabelData, ManageLabelServicePostIn,
+    NewDraftAttachment, SendDraftData, SendDraftParameters, TutanotaFile, UpdateMailFolderData,
 };
 use tutasdk::folder_system::{FolderSystem, MailSetKind};
 use tutasdk::services::generated::tutanota::{
-    ApplyLabelService, DraftService, ManageLabelService, SendDraftService,
+    ApplyLabelService, DraftService, MailFolderService, ManageLabelService, SendDraftService,
 };
 use tutasdk::services::ExtraServiceParams;
 use tutasdk::tutanota_constants::ArchiveDataType;
@@ -122,6 +122,43 @@ pub trait MailBackend: Send + Sync {
         target: &FolderInfo,
     ) -> Result<(), String>;
     async fn send_mail(&self, msg: &ParsedMessage) -> Result<(), String>;
+
+    // Folder management (IMAP CREATE / RENAME / DELETE). Defaults refuse, so
+    // a backend without it answers NO rather than pretending.
+    /// Create a custom folder under `parent` (top level when `None`).
+    async fn create_folder(&self, _name: &str, _parent: Option<&FolderInfo>) -> Result<(), String> {
+        Err("folder management is not supported by this backend".to_owned())
+    }
+    /// Give a folder a new name, keeping its place.
+    async fn rename_folder(&self, _folder: &FolderInfo, _name: &str) -> Result<(), String> {
+        Err("folder management is not supported by this backend".to_owned())
+    }
+    /// Move a folder under `parent` (top level when `None`), subfolders with it.
+    async fn move_folder(
+        &self,
+        _folder: &FolderInfo,
+        _parent: Option<&FolderInfo>,
+    ) -> Result<(), String> {
+        Err("folder management is not supported by this backend".to_owned())
+    }
+    /// Delete a folder for good.
+    async fn delete_folder(&self, _folder: &FolderInfo) -> Result<(), String> {
+        Err("folder management is not supported by this backend".to_owned())
+    }
+    /// Whether a folder holds no mail, asked of the server rather than the
+    /// local cache, which may lag.
+    async fn folder_is_empty(&self, _folder: &FolderInfo) -> Result<bool, String> {
+        Err("folder management is not supported by this backend".to_owned())
+    }
+}
+
+impl FolderInfo {
+    fn id_tuple(&self) -> IdTupleGenerated {
+        IdTupleGenerated::new(
+            GeneratedId(self.list_id.clone()),
+            GeneratedId(self.id.clone()),
+        )
+    }
 }
 
 /// Canonical IMAP name for a system folder, or `None` for custom/unsupported.
@@ -1028,6 +1065,118 @@ impl MailBackend for TutaSession {
             .map_err(|e| format!("{e}"))?;
 
         self.list_labels().await
+    }
+
+    async fn create_folder(&self, name: &str, parent: Option<&FolderInfo>) -> Result<(), String> {
+        // TS `MailFacade.createMailFolder`: a fresh session key for the new
+        // MailSet, encrypted with the mail owner-group key at its current
+        // version; the executor encrypts `folderName` with the session key.
+        let randomizer = RandomizerFacade::from_core(rand_core::OsRng);
+        let session_key: GenericAesKey = Aes256Key::generate(&randomizer).into();
+        let mail_group_id = self
+            .logged_in
+            .mail_facade()
+            .get_group_id_for_mail_address(&self.email)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        let group_key = self
+            .logged_in
+            .get_current_sym_group_key(&mail_group_id)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        let owner_enc_session_key = group_key
+            .object
+            .encrypt_key(&session_key, InitializationVector::generate(&randomizer));
+        self.logged_in
+            .get_service_executor()
+            .post::<MailFolderService>(
+                CreateMailFolderData {
+                    _format: 0,
+                    folderName: name.to_string(),
+                    ownerEncSessionKey: owner_enc_session_key,
+                    ownerGroup: Some(mail_group_id),
+                    ownerKeyVersion: group_key.version as i64,
+                    parentFolder: parent.map(FolderInfo::id_tuple),
+                    _errors: Default::default(),
+                },
+                ExtraServiceParams {
+                    session_key: Some(session_key),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("{e}"))
+    }
+
+    async fn rename_folder(&self, folder: &FolderInfo, name: &str) -> Result<(), String> {
+        // TS `MailFacade.updateMailFolderName`: an entity update of the
+        // MailSet; its `name` is encrypted with the set's own session key.
+        let client = self.crypto_client();
+        let mut set: MailSet = client
+            .load(&folder.id_tuple())
+            .await
+            .map_err(|e| format!("{e}"))?;
+        set.name = name.to_string();
+        client
+            .update_instance(set)
+            .await
+            .map_err(|e| format!("{e}"))
+    }
+
+    async fn move_folder(
+        &self,
+        folder: &FolderInfo,
+        parent: Option<&FolderInfo>,
+    ) -> Result<(), String> {
+        self.logged_in
+            .get_service_executor()
+            .put::<MailFolderService>(
+                UpdateMailFolderData {
+                    _format: 0,
+                    folder: folder.id_tuple(),
+                    newParent: parent.map(FolderInfo::id_tuple),
+                },
+                ExtraServiceParams::default(),
+            )
+            .await
+            .map_err(|e| format!("{e}"))
+    }
+
+    async fn delete_folder(&self, folder: &FolderInfo) -> Result<(), String> {
+        // The type is marked encrypted but holds no encrypted value; TS
+        // passes a dummy session key, and the executor insists on one.
+        let randomizer = RandomizerFacade::from_core(rand_core::OsRng);
+        let throwaway: GenericAesKey = Aes256Key::generate(&randomizer).into();
+        self.logged_in
+            .get_service_executor()
+            .delete::<MailFolderService>(
+                DeleteMailFolderData {
+                    _format: 0,
+                    folders: vec![folder.id_tuple()],
+                    _errors: Default::default(),
+                },
+                ExtraServiceParams {
+                    session_key: Some(throwaway),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| format!("{e}"))
+    }
+
+    async fn folder_is_empty(&self, folder: &FolderInfo) -> Result<bool, String> {
+        let entries: Vec<MailSetEntry> = self
+            .crypto_client()
+            .load_range(
+                &GeneratedId(folder.entries_list_id.clone()),
+                &CustomId::default(),
+                1,
+                ListLoadDirection::DESC,
+            )
+            .await
+            .map_err(|e| format!("{e}"))?;
+        Ok(entries.is_empty())
     }
 
     async fn apply_labels(
