@@ -125,7 +125,7 @@ pub trait MailBackend: Send + Sync {
 }
 
 /// Canonical IMAP name for a system folder, or `None` for custom/unsupported.
-fn system_imap_name(kind: MailSetKind) -> Option<&'static str> {
+pub(crate) fn system_imap_name(kind: MailSetKind) -> Option<&'static str> {
     match kind {
         MailSetKind::Inbox => Some("INBOX"),
         MailSetKind::Sent => Some("Sent"),
@@ -138,7 +138,7 @@ fn system_imap_name(kind: MailSetKind) -> Option<&'static str> {
 }
 
 /// RFC 6154 special-use attribute for a system folder.
-fn system_special_use(kind: MailSetKind) -> Option<&'static str> {
+pub(crate) fn system_special_use(kind: MailSetKind) -> Option<&'static str> {
     match kind {
         MailSetKind::Sent => Some("\\Sent"),
         MailSetKind::Draft => Some("\\Drafts"),
