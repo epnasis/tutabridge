@@ -496,20 +496,36 @@ impl ImapSession {
                     let mail = self.mails[idx].mail.clone();
                     match self.backend.load_mail_details(&mail).await {
                         Ok(Some(details)) => {
-                            let (atts, attachments_complete) =
-                                match self.backend.load_attachments(&mail).await {
-                                    Ok(atts) => (atts, true),
-                                    Err(_) => (Vec::new(), false),
-                                };
+                            // As prefetch: a transient attachment failure keeps
+                            // the body in memory for the syncer's retry pass; a
+                            // permanent one ships and persists it body-only, or
+                            // it would never be saved or searchable.
+                            let (atts, attachments_pending) = match self
+                                .backend
+                                .load_attachments(&mail)
+                                .await
+                            {
+                                Ok(atts) => (atts, false),
+                                Err(e) if crate::sync::is_transient_attachment_error(&e) => {
+                                    (Vec::new(), true)
+                                }
+                                Err(e) => {
+                                    warn!(
+                                            "Attachments of uid={} failed for good, serving the body alone: {e}",
+                                            self.mails[idx].uid
+                                        );
+                                    (Vec::new(), false)
+                                }
+                            };
                             let refs: Vec<(&TutanotaFile, &[u8])> =
                                 atts.iter().map(|(f, d)| (f, d.as_slice())).collect();
                             let rfc = mail_to_rfc2822(&mail, Some(&details), &refs);
                             // Persist it like a prefetched body, so it survives a
-                            // restart and SEARCH BODY finds it. A rendition missing
-                            // its attachments stays memory-only: once on disk,
-                            // prefetch takes `has_eml` to mean done.
-                            if let (true, Some(eid), Some(ls)) =
-                                (attachments_complete, &elem_id, &self.local_store)
+                            // restart and SEARCH BODY finds it. A rendition still
+                            // waiting for its attachments stays memory-only: once
+                            // on disk, prefetch takes `has_eml` to mean done.
+                            if let (false, Some(eid), Some(ls)) =
+                                (attachments_pending, &elem_id, &self.local_store)
                             {
                                 if let Err(e) = ls.write_eml(eid, &rfc) {
                                     warn!("Failed to cache eml {eid}: {e}");
@@ -539,7 +555,7 @@ impl ImapSession {
                                         // picks it up; without the flag the
                                         // attachments stay missing until a
                                         // restart.
-                                        !attachments_complete,
+                                        attachments_pending,
                                     )
                                     .await;
                             }
@@ -2180,6 +2196,7 @@ mod tests {
         labels: Mutex<Vec<crate::labels::LabelInfo>>,
         fail_details: Mutex<bool>,
         fail_attachments: Mutex<bool>,
+        attachments_fail_for_good: Mutex<bool>,
     }
 
     impl MockBackend {
@@ -2195,6 +2212,7 @@ mod tests {
                 labels: Mutex::new(Vec::new()),
                 fail_details: Mutex::new(false),
                 fail_attachments: Mutex::new(false),
+                attachments_fail_for_good: Mutex::new(false),
             }
         }
 
@@ -2740,6 +2758,43 @@ mod tests {
             local_store.search_body("inline").unwrap(),
             vec![mail_id.to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn a_permanent_attachment_failure_persists_the_body_alone() {
+        use crypto_primitives::aes::Aes256Key;
+        use crypto_primitives::key::GenericAesKey;
+        use crypto_primitives::randomizer_facade::RandomizerFacade;
+
+        let tmp = std::env::temp_dir().join(format!("tutabridge_test_{}", rand::random::<u64>()));
+        let key = GenericAesKey::Aes256(Aes256Key::generate(&RandomizerFacade::from_core(
+            rand_core::OsRng,
+        )));
+        let local_store =
+            Arc::new(LocalStore::open(&tmp.join("s.db"), &tmp.join("mails"), key).unwrap());
+        let mail = make_mail("od", "subj", true);
+        local_store
+            .upsert_mail_metadata(&crate::sync::mail_to_metadata(&mail, "inbox", 1))
+            .unwrap();
+        let backend = Arc::new(MockBackend::with_mails(vec![mail.clone()]));
+        backend.add_details("od", make_details("<p>wombat</p>"));
+        *backend.fail_attachments.lock().unwrap() = true;
+        *backend.attachments_fail_for_good.lock().unwrap() = true;
+        let store = MailStore::new();
+        populate_store(&store, &[mail]).await;
+        let mut session = ImapSession::new(store.clone(), backend, None, Some(local_store.clone()));
+        session.handle_command("a LOGIN u p").await;
+        session.handle_command("b SELECT INBOX").await;
+        let resp = session.handle_command("c UID FETCH 1 (BODY.PEEK[])").await;
+        assert!(resp.last().unwrap().contains("OK"), "{resp:?}");
+
+        assert!(local_store.has_eml("od"));
+        assert!(local_store.load_folder_metadata("inbox").unwrap()[0].has_details);
+        assert_eq!(
+            local_store.search_body("wombat").unwrap(),
+            vec!["od".to_string()]
+        );
+        assert!(!store.get_folder("inbox").await[0].attachments_pending);
     }
 
     #[tokio::test]
@@ -3415,7 +3470,13 @@ mod tests {
             String,
         > {
             if *self.fail_attachments.lock().unwrap() {
-                return Err("simulated attachment failure".to_string());
+                // Worded like the SDK's transient session-key failure unless
+                // a test asks for a permanent one.
+                return Err(if *self.attachments_fail_for_good.lock().unwrap() {
+                    "HTTP 404 (simulated)".to_string()
+                } else {
+                    "Session key resolution failure (simulated)".to_string()
+                });
             }
             // The mock has no attachment fixtures; the IMAP-session tests
             // only exercise body/header paths.

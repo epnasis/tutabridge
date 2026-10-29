@@ -1078,7 +1078,7 @@ pub(crate) async fn prefetch_details(
 /// `TutaSession::load_file_with_retry` helper logs as
 /// "still not decryptable after retries". Matching on the string keeps us
 /// decoupled from the SDK error variant tree.
-fn is_transient_attachment_error(err: &str) -> bool {
+pub(crate) fn is_transient_attachment_error(err: &str) -> bool {
     err.contains("missing owner key/group data")
         || err.contains("Session key resolution failure")
         || err.contains("still not decryptable")
