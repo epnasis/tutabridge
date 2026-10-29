@@ -183,7 +183,9 @@ fn contains_ci(haystack: &str, needle: &str) -> bool {
 /// With an empty `value`, matches when the header is merely present.
 fn header_contains(headers: &str, name: &str, value: &str) -> bool {
     let name_lc = name.to_lowercase();
-    for line in headers.split("\r\n") {
+    // RFC 5322 §2.2.3 unfolding: a long To/Cc is folded across lines.
+    let unfolded = headers.replace("\r\n ", " ").replace("\r\n\t", "\t");
+    for line in unfolded.split("\r\n") {
         if let Some((field, val)) = line.split_once(':') {
             if field.trim().to_lowercase() == name_lc {
                 if value.is_empty() || contains_ci(val, value) {
@@ -546,6 +548,14 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_search_sees_folded_continuation_lines() {
+        let headers = "To: a@x.test,\r\n b@x.test,\r\n\tc@x.test\r\nSubject: s\r\n";
+        assert!(header_contains(headers, "To", "b@x.test"));
+        assert!(header_contains(headers, "To", "c@x.test"));
+        assert!(!header_contains(headers, "Subject", "b@x.test"));
+    }
 
     fn day(y: i64, m: i64, d: i64) -> i64 {
         days_from_civil(y, m, d)

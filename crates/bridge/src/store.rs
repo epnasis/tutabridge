@@ -12,6 +12,12 @@ use rusqlite::{Connection, OptionalExtension};
 /// encrypted .eml files are keyed by element id and survive the migration.
 const SCHEMA_VERSION: &str = "4";
 
+/// Bumped when `mail_to_rfc2822` changes what it emits for a mail whose
+/// rendition is already cached. A mismatch deletes every `.eml.enc` and
+/// clears `has_details`, so the prefetch loop and on-demand FETCH re-render
+/// them. "2": every rendition carries `X-Tutabridge-Authentication`.
+const RENDITION_VERSION: &str = "2";
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("Database error: {0}")]
@@ -57,6 +63,27 @@ fn fts_match_expr(term: &str) -> String {
         .map(|w| format!("{w}*"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Delete every cached rendition (and any interrupted write) and return how
+/// many files there were. A file that
+/// cannot be deleted is an error: it would otherwise be served as current.
+fn remove_renditions(mails_dir: &Path) -> Result<usize, StoreError> {
+    let mut removed = 0;
+    if mails_dir.exists() {
+        for entry in std::fs::read_dir(mails_dir)? {
+            let path = entry?.path();
+            // `.tmp`: a write interrupted before its rename.
+            if matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("enc" | "tmp")
+            ) {
+                std::fs::remove_file(&path)?;
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
 }
 
 impl LocalStore {
@@ -146,6 +173,35 @@ impl LocalStore {
         })
     }
 
+    /// Delete renditions written by an older `mail_to_rfc2822` so they are
+    /// re-rendered, and return how many were dropped. Separate from [`open`]
+    /// because only the bridge may do this: a backup run must not wipe the
+    /// cache it reads from.
+    ///
+    /// The version is recorded only once every file is gone, so a failed or
+    /// interrupted pass is redone at the next start.
+    ///
+    /// [`open`]: LocalStore::open
+    pub fn drop_stale_renditions(&self) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let rendition: Option<String> = conn
+            .query_row(
+                "SELECT value FROM store_meta WHERE key = 'rendition_version'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if rendition.as_deref() == Some(RENDITION_VERSION) {
+            return Ok(0);
+        }
+        let removed = remove_renditions(&self.mails_dir)?;
+        conn.execute_batch(&format!(
+            "UPDATE mails SET has_details = 0;
+             INSERT OR REPLACE INTO store_meta(key, value) VALUES ('rendition_version', '{RENDITION_VERSION}');"
+        ))?;
+        Ok(removed)
+    }
+
     pub fn verify_key(&self) -> bool {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
@@ -185,18 +241,12 @@ impl LocalStore {
              DELETE FROM sync_state;
              DELETE FROM store_meta;
              DELETE FROM mail_fts;
-             INSERT INTO store_meta(key, value) VALUES ('schema_version', '{SCHEMA_VERSION}');"
+             INSERT INTO store_meta(key, value) VALUES ('schema_version', '{SCHEMA_VERSION}');
+             INSERT INTO store_meta(key, value) VALUES ('rendition_version', '{RENDITION_VERSION}');"
         ))?;
         drop(conn);
 
-        if self.mails_dir.exists() {
-            for entry in std::fs::read_dir(&self.mails_dir)? {
-                let entry = entry?;
-                if entry.path().extension().and_then(|e| e.to_str()) == Some("enc") {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
-        }
+        remove_renditions(&self.mails_dir)?;
         Ok(())
     }
 
@@ -390,7 +440,12 @@ impl LocalStore {
             .map_err(|e| StoreError::Crypto(format!("{e:?}")))?;
 
         let final_path = self.mails_dir.join(format!("{element_id}.eml.enc"));
-        let tmp_path = self.mails_dir.join(format!("{element_id}.eml.enc.tmp"));
+        // Per-write tmp name: the syncer, the event handler and every IMAP
+        // session may render the same mail at once.
+        let tmp_path = self.mails_dir.join(format!(
+            "{element_id}.eml.enc.{:016x}.tmp",
+            rand::random::<u64>()
+        ));
         std::fs::write(&tmp_path, &encrypted)?;
         std::fs::rename(&tmp_path, &final_path)?;
         Ok(())
@@ -893,6 +948,54 @@ mod tests {
         assert!(!store.load_folder_metadata("inbox").unwrap()[0].has_details);
 
         store.mark_has_details("det").unwrap();
+        assert!(store.load_folder_metadata("inbox").unwrap()[0].has_details);
+    }
+
+    #[test]
+    fn stale_renditions_are_dropped_once_and_current_ones_kept() {
+        let key = test_key();
+        let tmp_dir =
+            std::env::temp_dir().join(format!("tutabridge_test_{}", rand::random::<u64>()));
+        let db_path = tmp_dir.join("test.db");
+        let mails_dir = tmp_dir.join("mails");
+
+        let store = LocalStore::open(&db_path, &mails_dir, key.clone()).unwrap();
+        store
+            .upsert_mail_metadata(&meta("old", "inbox", 0))
+            .unwrap();
+        store.write_eml("old", "Date: x\r\n\r\nbody").unwrap();
+        store.mark_has_details("old").unwrap();
+        // A store written before renditions were versioned.
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM store_meta WHERE key = 'rendition_version'", [])
+            .unwrap();
+        drop(store);
+
+        // A write interrupted before its rename.
+        std::fs::write(mails_dir.join("old.eml.enc.0123456789abcdef.tmp"), b"x").unwrap();
+
+        let store = LocalStore::open(&db_path, &mails_dir, key.clone()).unwrap();
+        // Opening alone (what backup does) never touches the cache.
+        assert!(store.has_eml("old"));
+        assert_eq!(store.drop_stale_renditions().unwrap(), 2);
+        assert_eq!(std::fs::read_dir(&mails_dir).unwrap().count(), 0);
+        assert!(!store.has_eml("old"));
+        assert!(!store.load_folder_metadata("inbox").unwrap()[0].has_details);
+        assert_eq!(
+            store.get_meta("rendition_version").as_deref(),
+            Some(RENDITION_VERSION)
+        );
+
+        store.write_eml("old", "re-rendered").unwrap();
+        store.mark_has_details("old").unwrap();
+        drop(store);
+
+        let store = LocalStore::open(&db_path, &mails_dir, key).unwrap();
+        assert_eq!(store.drop_stale_renditions().unwrap(), 0);
+        assert!(store.has_eml("old"));
         assert!(store.load_folder_metadata("inbox").unwrap()[0].has_details);
     }
 }

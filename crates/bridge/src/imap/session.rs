@@ -1,11 +1,11 @@
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::sync::Arc;
 use tutasdk::entities::generated::tutanota::{Mail, MailAddress, MailDetails, TutanotaFile};
 
 use crate::imap::search::{self, MsgView};
 use crate::labels::{LabelInfo, LabelRegistry};
-use crate::mail::mail_to_rfc2822;
 use crate::mail::rfc2822::{extract_headers, format_address, format_internal_date};
+use crate::mail::{mail_to_rfc2822, strip_html};
 use crate::store::LocalStore;
 use crate::sync::MailStore;
 use crate::tuta::{FolderInfo, MailBackend};
@@ -447,14 +447,36 @@ impl ImapSession {
                     let mail = self.mails[idx].mail.clone();
                     match self.backend.load_mail_details(&mail).await {
                         Ok(Some(details)) => {
-                            let atts = self
-                                .backend
-                                .load_attachments(&mail)
-                                .await
-                                .unwrap_or_default();
+                            let (atts, attachments_complete) =
+                                match self.backend.load_attachments(&mail).await {
+                                    Ok(atts) => (atts, true),
+                                    Err(_) => (Vec::new(), false),
+                                };
                             let refs: Vec<(&TutanotaFile, &[u8])> =
                                 atts.iter().map(|(f, d)| (f, d.as_slice())).collect();
                             let rfc = mail_to_rfc2822(&mail, Some(&details), &refs);
+                            // Persist it like a prefetched body, so it survives a
+                            // restart and SEARCH BODY finds it. A rendition missing
+                            // its attachments stays memory-only: once on disk,
+                            // prefetch takes `has_eml` to mean done.
+                            if let (true, Some(eid), Some(ls)) =
+                                (attachments_complete, &elem_id, &self.local_store)
+                            {
+                                if let Err(e) = ls.write_eml(eid, &rfc) {
+                                    warn!("Failed to cache eml {eid}: {e}");
+                                } else if let Err(e) = ls.mark_has_details(eid) {
+                                    warn!("Failed to mark has_details {eid}: {e}");
+                                }
+                                let body_html = details
+                                    .body
+                                    .compressedText
+                                    .as_deref()
+                                    .or(details.body.text.as_deref())
+                                    .unwrap_or("");
+                                if let Err(e) = ls.index_body(eid, &strip_html(body_html)) {
+                                    warn!("Failed to index body {eid}: {e}");
+                                }
+                            }
                             // Share into the in-memory store so other
                             // connections (and stats) see it too.
                             if let (Some(eid), Some(folder)) = (&elem_id, &self.selected_folder) {
@@ -2111,6 +2133,7 @@ mod tests {
         /// Backend-side label list; `create_label` appends here.
         labels: Mutex<Vec<crate::labels::LabelInfo>>,
         fail_details: Mutex<bool>,
+        fail_attachments: Mutex<bool>,
     }
 
     impl MockBackend {
@@ -2125,6 +2148,7 @@ mod tests {
                 labels_applied: Mutex::new(Vec::new()),
                 labels: Mutex::new(Vec::new()),
                 fail_details: Mutex::new(false),
+                fail_attachments: Mutex::new(false),
             }
         }
 
@@ -2212,6 +2236,80 @@ mod tests {
         assert_eq!(moved.len(), 1);
         assert_eq!(moved[0].1, "cust");
         assert_eq!(moved[0].0.len(), 1);
+    }
+
+    /// Fetch one not-yet-loaded mail on demand through a session backed by a
+    /// real `LocalStore`; returns the FETCH response, the backend and the store.
+    async fn on_demand_fetch(
+        fail_attachments: bool,
+    ) -> (Vec<String>, Arc<MockBackend>, Arc<LocalStore>) {
+        use crypto_primitives::aes::Aes256Key;
+        use crypto_primitives::key::GenericAesKey;
+        use crypto_primitives::randomizer_facade::RandomizerFacade;
+
+        let tmp = std::env::temp_dir().join(format!("tutabridge_test_{}", rand::random::<u64>()));
+        let key = GenericAesKey::Aes256(Aes256Key::generate(&RandomizerFacade::from_core(
+            rand_core::OsRng,
+        )));
+        let local_store =
+            Arc::new(LocalStore::open(&tmp.join("s.db"), &tmp.join("mails"), key).unwrap());
+
+        let mail = make_mail("od", "subj", true);
+        local_store
+            .upsert_mail_metadata(&crate::sync::mail_to_metadata(&mail, "inbox", 1))
+            .unwrap();
+        let backend = Arc::new(MockBackend::with_mails(vec![mail.clone()]));
+        backend.add_details("od", make_details("<p>quokka</p>"));
+        *backend.fail_attachments.lock().unwrap() = fail_attachments;
+        let store = MailStore::new();
+        store.set_folder_list(vec![inbox_folder()]).await;
+        store
+            .set_folder(
+                "inbox",
+                vec![StoredMail {
+                    mail,
+                    details: None,
+                    rfc2822: None,
+                    uid: 1,
+                    attachments_pending: false,
+                }],
+            )
+            .await;
+        let mut session = ImapSession::new(store, backend.clone(), None, Some(local_store.clone()));
+        session.handle_command("a LOGIN u p").await;
+        session.handle_command("b SELECT INBOX").await;
+        let resp = session.handle_command("c UID FETCH 1 (BODY.PEEK[])").await;
+        (resp, backend, local_store)
+    }
+
+    #[tokio::test]
+    async fn on_demand_body_fetch_persists_and_indexes_the_rendition() {
+        let (resp, backend, local_store) = on_demand_fetch(false).await;
+        assert!(resp.last().unwrap().contains("OK"), "{resp:?}");
+        assert!(
+            resp[0].contains("BODY[] {") && resp[0].contains("\r\nX-Tutabridge-Authentication: "),
+            "{resp:?}"
+        );
+        // PEEK reads without marking the mail read.
+        assert!(backend.unread_calls.lock().unwrap().is_empty());
+
+        let cached = local_store.read_eml("od").unwrap().unwrap();
+        assert!(cached.starts_with("X-Tutabridge-Authentication: "));
+        assert!(local_store.load_folder_metadata("inbox").unwrap()[0].has_details);
+        assert_eq!(
+            local_store.search_body("quokka").unwrap(),
+            vec!["od".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn on_demand_body_fetch_with_failed_attachments_is_not_persisted() {
+        let (resp, _, local_store) = on_demand_fetch(true).await;
+        assert!(resp.last().unwrap().contains("OK"), "{resp:?}");
+        // Served from memory, but not written: on disk, prefetch would take
+        // it as done and the attachments would never be retried.
+        assert!(!local_store.has_eml("od"));
+        assert!(!local_store.load_folder_metadata("inbox").unwrap()[0].has_details);
     }
 
     #[tokio::test]
@@ -2784,6 +2882,9 @@ mod tests {
             )>,
             String,
         > {
+            if *self.fail_attachments.lock().unwrap() {
+                return Err("simulated attachment failure".to_string());
+            }
             // The mock has no attachment fixtures; the IMAP-session tests
             // only exercise body/header paths.
             Ok(Vec::new())
