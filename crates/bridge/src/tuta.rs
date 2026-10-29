@@ -241,18 +241,33 @@ impl TutaSession {
         &self,
         mailbox: &MailBox,
     ) -> Result<Vec<MailSet>, ApiCallError> {
-        // Same list + limit `load_folders_for_mailbox` uses.
-        let items = self
-            .logged_in
-            .mail_facade()
-            .get_crypto_entity_client()
-            .load_range_tolerant::<MailSet, GeneratedId>(
-                &mailbox.mailSets.mailSets,
-                &GeneratedId::min_id(),
-                100,
-                ListLoadDirection::ASC,
-            )
-            .await?;
+        // Paged: one page of 100 (what `load_folders_for_mailbox` loads)
+        // would silently drop folders and labels past it — and a CREATE could
+        // then not find the folder it just made.
+        const PAGE: usize = 100;
+        let client = self.logged_in.mail_facade().get_crypto_entity_client();
+        let mut items = Vec::new();
+        let mut start = GeneratedId::min_id();
+        loop {
+            let page = client
+                .load_range_tolerant::<MailSet, GeneratedId>(
+                    &mailbox.mailSets.mailSets,
+                    &start,
+                    PAGE,
+                    ListLoadDirection::ASC,
+                )
+                .await?;
+            let full = page.len() == PAGE;
+            let last = page
+                .last()
+                .and_then(|item| item.id.as_ref())
+                .map(|id| id.element_id.clone());
+            items.extend(page);
+            match (full, last) {
+                (true, Some(last)) => start = last,
+                _ => break,
+            }
+        }
         let mut sets = Vec::with_capacity(items.len());
         for item in items {
             match item.result {
@@ -1166,13 +1181,16 @@ impl MailBackend for TutaSession {
     }
 
     async fn folder_is_empty(&self, folder: &FolderInfo) -> Result<bool, String> {
+        // Ascending from the smallest id, as TS `isEmptyFolder`
+        // (CUSTOM_MIN_ID, 1, false): descending from it reads below the
+        // minimum and always finds nothing — every folder would look empty.
         let entries: Vec<MailSetEntry> = self
             .crypto_client()
             .load_range(
                 &GeneratedId(folder.entries_list_id.clone()),
                 &CustomId::default(),
                 1,
-                ListLoadDirection::DESC,
+                ListLoadDirection::ASC,
             )
             .await
             .map_err(|e| format!("{e}"))?;

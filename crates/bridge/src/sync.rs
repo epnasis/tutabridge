@@ -140,6 +140,18 @@ impl MailStore {
     /// still opens), `INBOX` in any case, then a case-insensitive match only
     /// when it is unique — a hand-typed `sent` still finds Sent, but `WORK`
     /// never acts on `Work` while both exist.
+    /// The folder with exactly this name (INBOX in any case) — for "does
+    /// this name exist?", where a near-miss in another casing must not count.
+    pub async fn folder_by_exact_path(&self, path: &str) -> Option<FolderInfo> {
+        let path = match path.split_once('/') {
+            Some((first, rest)) if first.eq_ignore_ascii_case("INBOX") => format!("INBOX/{rest}"),
+            None if path.eq_ignore_ascii_case("INBOX") => "INBOX".to_owned(),
+            _ => path.to_owned(),
+        };
+        let list = self.folder_list.read().await;
+        list.iter().find(|f| f.imap_path == path).cloned()
+    }
+
     pub async fn folder_by_imap_path(&self, path: &str) -> Option<FolderInfo> {
         let list = self.folder_list.read().await;
         if let Some(exact) = list.iter().find(|f| f.imap_path == path) {
