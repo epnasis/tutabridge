@@ -1256,6 +1256,28 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn replace_folder_keeping_judges_the_folder_as_it_is_now() {
+        let store = MailStore::new();
+        let listed = stored(make_mail("L1", "M1", "listed", false), 1);
+        let late = stored(make_mail("L1", "M2", "late", false), 5);
+        // An event added `late` after the sync took its snapshot: kept.
+        store.set_folder("f", vec![late.clone()]).await;
+        store
+            .replace_folder_keeping("f", vec![listed.clone()], |m| m.uid >= 3)
+            .await;
+        let mut uids: Vec<u32> = store.get_folder("f").await.iter().map(|m| m.uid).collect();
+        uids.sort();
+        assert_eq!(uids, [1, 5]);
+        // An event deleted it before the write: not brought back.
+        store.set_folder("f", vec![]).await;
+        store
+            .replace_folder_keeping("f", vec![listed], |m| m.uid >= 3)
+            .await;
+        let uids: Vec<u32> = store.get_folder("f").await.iter().map(|m| m.uid).collect();
+        assert_eq!(uids, [1]);
+    }
+
+    #[tokio::test]
     async fn refresh_mail_in_place_updates_metadata_in_every_folder() {
         let store = MailStore::new();
         // Same mail referenced in two folders (Tuta's model allows this via
