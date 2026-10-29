@@ -381,6 +381,24 @@ impl MailStore {
         self.bump_generation();
     }
 
+    /// Replace a folder's mails, keeping those of the CURRENT ones that
+    /// `keep` selects — decided under the write lock, so an event landing
+    /// meanwhile is neither undone nor overwritten.
+    pub(crate) async fn replace_folder_keeping(
+        &self,
+        folder_id: &str,
+        mut mails: Vec<StoredMail>,
+        keep: impl Fn(&StoredMail) -> bool,
+    ) {
+        let mut folders = self.folders.write().await;
+        if let Some(current) = folders.remove(folder_id) {
+            mails.extend(current.into_iter().filter(|m| keep(m)));
+        }
+        folders.insert(folder_id.to_string(), mails);
+        drop(folders);
+        self.bump_generation();
+    }
+
     fn bump_generation(&self) {
         let gen = self
             .gen_counter
@@ -849,16 +867,20 @@ pub(crate) async fn sync_folder(
         ),
     }
 
-    // Mail that got its UID while the listing ran (an event, an APPEND) may
-    // be missing from it; dropping it here would EXPUNGE it from clients and
-    // bring it back under the same UID at the next sync. Kept as the DB
-    // cleanup above keeps it.
+    // Mail the event handler added while the listing ran may be missing from
+    // it; dropping it would EXPUNGE it from clients and bring it back under
+    // the same UID at the next sync. Kept as the DB cleanup above keeps it.
     let listed: HashSet<&str> = current_ids.iter().copied().collect();
-    updated.extend(existing_map.into_iter().filter_map(|(eid, mail)| {
-        (mail.uid >= listed_below_uid && !listed.contains(eid.as_str())).then_some(mail)
-    }));
-
-    store.set_folder(&folder.id, updated).await;
+    store
+        .replace_folder_keeping(&folder.id, updated, |mail| {
+            mail.uid >= listed_below_uid
+                && mail
+                    .mail
+                    ._id
+                    .as_ref()
+                    .is_some_and(|id| !listed.contains(id.element_id.as_str()))
+        })
+        .await;
 
     Ok(())
 }
