@@ -595,7 +595,8 @@ impl LocalStore {
         pending: bool,
     ) -> Result<(), StoreError> {
         // The column holds when the mail first went pending (0 = not): the
-        // retry pass gives up by age, which a restart does not reset.
+        // retry pass gives up by age, which a restart does not reset. A bare
+        // 1 (the earlier boolean form) is restamped, or it would never age.
         let conn = self.conn.lock().unwrap();
         let since_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -603,7 +604,7 @@ impl LocalStore {
         conn.execute(
             "UPDATE mails SET attachments_pending = CASE
                  WHEN ?2 = 0 THEN 0
-                 WHEN attachments_pending = 0 THEN ?2
+                 WHEN attachments_pending IN (0, 1) THEN ?2
                  ELSE attachments_pending END
              WHERE element_id = ?1",
             rusqlite::params![element_id, if pending { since_ms } else { 0 }],

@@ -2817,6 +2817,12 @@ mod tests {
         .await;
         // Still transient, attempt 1, age unknown: kept pending.
         assert!(store.get_folder("inbox").await[0].attachments_pending);
+        // And the failed retry stamped a real time, so the age cap applies.
+        let since = local_store
+            .attachments_pending_since("od")
+            .unwrap()
+            .unwrap();
+        assert!(since > 1, "still legacy: {since}");
         let _ = backend;
     }
 

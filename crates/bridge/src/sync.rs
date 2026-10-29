@@ -855,7 +855,13 @@ pub(crate) async fn sync_folder(
                     .is_some()
             });
             let rfc2822 = match (&elem_id, attachments_pending) {
-                (Some(eid), true) => local_store.read_eml(eid).ok().flatten(),
+                (Some(eid), true) => match local_store.read_eml(eid) {
+                    Ok(eml) => eml,
+                    Err(e) => {
+                        warn!("Failed to read cached eml {}: {}", eid, e);
+                        None
+                    }
+                },
                 _ => None,
             };
             updated.push(StoredMail {
@@ -1174,6 +1180,10 @@ pub(crate) async fn prefetch_details(
             }
             Err(e) if is_transient_attachment_error(&e) && !give_up => {
                 debug!("Attachment retry {attempts} for {eid} still transient: {e}");
+                // Keeps the earliest time; stamps one on a legacy flag.
+                if let Err(e) = local_store.set_attachments_pending(&eid, true) {
+                    warn!("Failed to mark attachments pending {}: {}", eid, e);
+                }
             }
             Err(e) => {
                 warn!(
