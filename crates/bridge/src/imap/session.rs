@@ -535,31 +535,45 @@ impl ImapSession {
             self.backend.delete_folder(folder).await?;
             return Ok(false);
         }
-        // Tuta allows two siblings with one name, IMAP cannot address them:
-        // the folder takes a name free both where it is and in the target,
-        // and is renamed BEFORE the move, so a failure between the two
-        // calls can never leave a duplicate.
+        // Tuta allows two siblings with one name, IMAP cannot address them,
+        // so the folder must never sit next to its namesake — not even
+        // between two calls that a failure could separate.
         let current_leaf = folder.imap_path.rsplit('/').next().unwrap_or_default();
-        let current_parent = folder.imap_path.rsplit_once('/').map(|(p, _)| p);
-        let taken = |name: String| async move {
-            let in_target = format!("{}/{name}", target.imap_path);
-            let here = match current_parent {
+        let free_in = |parent: Option<String>, name: String| async move {
+            let path = match parent {
                 Some(parent) => format!("{parent}/{name}"),
-                None => name.clone(),
+                None => name,
             };
-            self.store.folder_by_exact_path(&in_target).await.is_some()
-                || (name != current_leaf && self.store.folder_by_exact_path(&here).await.is_some())
+            self.store.folder_by_exact_path(&path).await.is_none()
         };
-        let mut free = wanted_leaf.to_string();
+        let mut wanted = wanted_leaf.to_string();
         let mut n = 2;
-        while taken(free.clone()).await {
-            free = format!("{wanted_leaf} ({n})");
+        while !free_in(Some(target.imap_path.clone()), wanted.clone()).await {
+            wanted = format!("{wanted_leaf} ({n})");
             n += 1;
         }
-        if free != current_leaf {
-            self.backend.rename_folder(folder, &free).await?;
+        if free_in(Some(target.imap_path.clone()), current_leaf.to_string()).await {
+            // Its name is free in the target: move, then take the wanted one.
+            self.backend.move_folder(folder, Some(target)).await?;
+            if wanted != current_leaf {
+                self.backend.rename_folder(folder, &wanted).await?;
+            }
+        } else {
+            // Taken there: take the wanted name first. `wanted` is free in the
+            // target; it must be free where the folder is now too.
+            let current_parent = folder
+                .imap_path
+                .rsplit_once('/')
+                .map(|(p, _)| p.to_string());
+            while !free_in(current_parent.clone(), wanted.clone()).await
+                || !free_in(Some(target.imap_path.clone()), wanted.clone()).await
+            {
+                wanted = format!("{wanted_leaf} ({n})");
+                n += 1;
+            }
+            self.backend.rename_folder(folder, &wanted).await?;
+            self.backend.move_folder(folder, Some(target)).await?;
         }
-        self.backend.move_folder(folder, Some(target)).await?;
         Ok(true)
     }
 
@@ -3332,14 +3346,36 @@ mod tests {
             ["rename Work -> Work (2)", "move Work (2) -> Trash"]
         );
 
-        // A new name into Trash: one rename, not two.
+        // A new name into Trash: one rename, not two; its own name is free
+        // there, so it moves first — even with a namesake of the new name
+        // where it is now (a rename first would have to dodge it).
+        session.handle_command("f0 CREATE Renamed").await;
+        ops(&backend);
         let resp = session.handle_command("f RENAME Other Trash/Renamed").await;
         assert_eq!(resp, ["f OK RENAME completed\r\n"]);
         assert_eq!(
             ops(&backend),
-            ["rename Other -> Renamed", "move Renamed -> Trash"]
+            ["move Other -> Trash", "rename Trash/Other -> Renamed"]
         );
         assert!(paths(&store).await.contains(&"Trash/Renamed".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_rename_before_the_move_dodges_a_namesake_where_it_is() {
+        let (backend, store, mut session) = folder_session().await;
+        session.handle_command("b CREATE Trash/Work").await;
+        session.handle_command("c CREATE Work").await;
+        session.handle_command("d CREATE \"Work (2)\"").await;
+        let work = id_of(&store, "Work").await;
+        backend.nonempty.lock().unwrap().insert(work);
+        ops(&backend);
+        // "Work (2)" is free in Trash but taken next to Work.
+        let resp = session.handle_command("e DELETE Work").await;
+        assert!(resp[0].starts_with("e OK"), "{resp:?}");
+        assert_eq!(
+            ops(&backend),
+            ["rename Work -> Work (3)", "move Work (3) -> Trash"]
+        );
     }
 
     #[tokio::test]
@@ -4566,6 +4602,16 @@ mod tests {
             Ok(())
         }
         async fn rename_folder(&self, folder: &FolderInfo, name: &str) -> Result<(), String> {
+            // By id, as the server does: the record may predate a move.
+            let current = self
+                .folders
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|f| f.id == folder.id)
+                .cloned()
+                .ok_or("no such folder")?;
+            let folder = &current;
             let new_path = match folder.imap_path.rsplit_once('/') {
                 Some((parent, _)) => format!("{parent}/{name}"),
                 None => name.to_string(),
