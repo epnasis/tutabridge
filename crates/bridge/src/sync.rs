@@ -135,11 +135,17 @@ impl MailStore {
     }
 
     /// Look up a folder by its IMAP path (case-insensitive for INBOX).
+    /// Mailbox names are case-sensitive except `INBOX` (RFC 3501 §5.1), so
+    /// `WORK` never finds `Work` — that would let SUBSCRIBE, DELETE or RENAME
+    /// act on a folder the client did not name.
     pub async fn folder_by_imap_path(&self, path: &str) -> Option<FolderInfo> {
+        let canonical = match path.split_once('/') {
+            Some((first, rest)) if first.eq_ignore_ascii_case("INBOX") => format!("INBOX/{rest}"),
+            None if path.eq_ignore_ascii_case("INBOX") => "INBOX".to_owned(),
+            _ => path.to_owned(),
+        };
         let list = self.folder_list.read().await;
-        list.iter()
-            .find(|f| f.imap_path == path || f.imap_path.eq_ignore_ascii_case(path))
-            .cloned()
+        list.iter().find(|f| f.imap_path == canonical).cloned()
     }
 
     pub(crate) async fn set_folder_list(&self, folders: Vec<FolderInfo>) {
