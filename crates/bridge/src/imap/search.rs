@@ -55,7 +55,7 @@ impl SeqSet {
     /// `max` is the largest sequence number or UID in the mailbox, which `*`
     /// stands for: `*` alone is that one message, and `n:*` with `n` above it
     /// still includes it.
-    fn contains(&self, value: u32, max: u32) -> bool {
+    pub(crate) fn contains(&self, value: u32, max: u32) -> bool {
         self.ranges.iter().any(|r| {
             let (a, b) = (r.first.resolve(max), r.last.resolve(max));
             (a.min(b)..=a.max(b)).contains(&value)
@@ -121,6 +121,8 @@ pub enum SearchKey {
     /// A criterion the client got wrong; the whole SEARCH answers BAD rather
     /// than an empty success that would read as "no such mail".
     Invalid(String),
+    /// A `CHARSET` other than [`SUPPORTED_CHARSETS`]: NO [BADCHARSET].
+    BadCharset(String),
 }
 
 /// The slice of a message the matcher needs. Derived fields (From / To / Cc /
@@ -167,9 +169,12 @@ impl SearchContext {
     }
 
     fn body_matches(&self, term: &str, element_id: &str) -> bool {
-        self.body_hits
-            .get(term)
-            .is_some_and(|ids| ids.contains(element_id))
+        // RFC 3501: the empty string is in every message.
+        term.is_empty()
+            || self
+                .body_hits
+                .get(term)
+                .is_some_and(|ids| ids.contains(element_id))
     }
 }
 
@@ -270,7 +275,7 @@ pub fn matches(key: &SearchKey, m: &MsgView, ctx: &SearchContext) -> bool {
         SearchKey::Smaller(n) => m.size < *n,
 
         SearchKey::Uid(set) => set.contains(m.uid, ctx.max_uid),
-        SearchKey::Invalid(_) => false,
+        SearchKey::Invalid(_) | SearchKey::BadCharset(_) => false,
         SearchKey::Sequence(set) => set.contains(m.seq, ctx.max_seq),
     }
 }
@@ -289,6 +294,9 @@ enum Token {
     Quoted(String),
     /// A quoted string the input ended inside.
     Unterminated,
+    /// An IMAP literal (`{N}` / `{N+}`); its bytes would follow on the
+    /// next line, which the line reader does not join.
+    Literal,
 }
 
 fn tokenize(input: &str) -> Vec<Token> {
@@ -340,7 +348,11 @@ fn tokenize(input: &str) -> Vec<Token> {
                     s.push(ch);
                     chars.next();
                 }
-                tokens.push(Token::Atom(s));
+                tokens.push(if is_literal_marker(&s) {
+                    Token::Literal
+                } else {
+                    Token::Atom(s)
+                });
             }
         }
     }
@@ -354,6 +366,14 @@ fn tokenize(input: &str) -> Vec<Token> {
 /// under `NOT` an empty success.
 pub fn parse(args: &str) -> SearchKey {
     let tokens = tokenize(args);
+    if tokens.contains(&Token::Literal) {
+        return SearchKey::Invalid(
+            "literals are not supported in SEARCH; send the text as a quoted string".to_owned(),
+        );
+    }
+    if tokens.contains(&Token::Unterminated) {
+        return SearchKey::Invalid("unterminated quoted string".to_owned());
+    }
     let mut i = 0;
     let keys = parse_key_list(&tokens, &mut i, false);
     if keys.is_empty() {
@@ -424,7 +444,30 @@ fn is_flag_keyword(s: &str) -> bool {
         })
 }
 
+/// What SEARCH strings are decoded as. The line reader hands us UTF-8, and
+/// US-ASCII is a subset of it.
+pub const SUPPORTED_CHARSETS: [&str; 2] = ["US-ASCII", "UTF-8"];
+
+fn is_literal_marker(atom: &str) -> bool {
+    let Some(inner) = atom.strip_prefix('{').and_then(|a| a.strip_suffix('}')) else {
+        return false;
+    };
+    let digits = inner.strip_suffix('+').unwrap_or(inner);
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
 impl SearchKey {
+    /// The unsupported charset the query names, if any.
+    pub fn bad_charset(&self) -> Option<&str> {
+        match self {
+            SearchKey::BadCharset(name) => Some(name),
+            SearchKey::And(keys) => keys.iter().find_map(SearchKey::bad_charset),
+            SearchKey::Or(a, b) => a.bad_charset().or_else(|| b.bad_charset()),
+            SearchKey::Not(k) => k.bad_charset(),
+            _ => None,
+        }
+    }
+
     /// Why the query is malformed, if any criterion in it is.
     pub fn invalid_reason(&self) -> Option<&str> {
         match self {
@@ -462,7 +505,10 @@ fn parse_key(tokens: &[Token], i: &mut usize) -> Option<SearchKey> {
             })
         }
         Token::RParen => None,
-        Token::Unterminated => Some(SearchKey::Invalid("unterminated quoted string".to_owned())),
+        // Rejected by `parse` before any key is read.
+        Token::Unterminated | Token::Literal => {
+            Some(SearchKey::Invalid("unterminated quoted string".to_owned()))
+        }
         Token::Quoted(text) => Some(SearchKey::Invalid(format!(
             "{} is not a search key",
             echo(&text)
@@ -504,9 +550,16 @@ fn parse_atom_key(atom: &str, tokens: &[Token], i: &mut usize) -> SearchKey {
         // `CHARSET <name>` is a prefix, not a criterion — skip the name and
         // parse the key that follows.
         "CHARSET" => match next_arg(tokens, i) {
-            Some(_) => parse_key(tokens, i).unwrap_or_else(|| {
-                SearchKey::Invalid("CHARSET needs a criterion after it".to_owned())
-            }),
+            Some(name)
+                if SUPPORTED_CHARSETS
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(&name)) =>
+            {
+                parse_key(tokens, i).unwrap_or_else(|| {
+                    SearchKey::Invalid("CHARSET needs a criterion after it".to_owned())
+                })
+            }
+            Some(name) => SearchKey::BadCharset(name),
             None => SearchKey::Invalid("CHARSET needs a name".to_owned()),
         },
 
@@ -604,7 +657,7 @@ fn is_seqset(s: &str) -> bool {
 /// RFC 3501 `sequence-set`: comma-separated `seq-number` or
 /// `seq-number:seq-number`, where a `seq-number` is a non-zero number or `*`.
 /// `None` for anything else.
-fn parse_seqset(s: &str) -> Option<SeqSet> {
+pub(crate) fn parse_seqset(s: &str) -> Option<SeqSet> {
     let seq_number = |text: &str| -> Option<SeqNum> {
         if text == "*" {
             return Some(SeqNum::Star);
@@ -963,6 +1016,19 @@ mod tests {
         ] {
             assert!(parse(query).invalid_reason().is_some(), "{query}");
         }
+        for (query, reason) in [
+            ("SUBJECT {6}", "literals"),
+            ("BODY {3+}", "literals"),
+            ("SUBJECT \"open", "unterminated"),
+        ] {
+            let parsed = parse(query);
+            assert!(parsed.invalid_reason().unwrap().contains(reason), "{query}");
+        }
+        assert_eq!(
+            parse("CHARSET ISO-8859-2 SUBJECT x").bad_charset(),
+            Some("ISO-8859-2")
+        );
+        assert!(parse("CHARSET utf-8 SUBJECT x").bad_charset().is_none());
         for query in ["SINCE 29-Feb-2024", "SINCE 01-Jan-2024", "SINCE 1-jan-2024"] {
             assert!(parse(query).invalid_reason().is_none(), "{query}");
         }

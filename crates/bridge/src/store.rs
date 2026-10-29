@@ -51,10 +51,13 @@ pub struct LocalStore {
 /// ANDed together (FTS5's default). Because only alphanumerics survive, the
 /// result can never contain FTS5 syntax, so it is injection-safe to interpolate
 /// as a bound parameter. Returns an empty string when nothing is searchable.
-fn fts_match_expr(term: &str) -> String {
+///
+/// Each word is quoted: bare, `NOT`, `AND`, `OR` and `NEAR` are FTS5
+/// operators, and `NOT*` is a syntax error, not a search for "not".
+pub(crate) fn fts_match_expr(term: &str) -> String {
     term.split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty())
-        .map(|w| format!("{w}*"))
+        .map(|w| format!("\"{w}\"*"))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -692,9 +695,24 @@ mod tests {
     #[test]
     fn fts_match_expr_is_injection_safe() {
         // FTS syntax characters never survive into the expression.
-        assert_eq!(fts_match_expr(r#"foo" OR bar"#), "foo* OR* bar*");
-        assert_eq!(fts_match_expr("a-b.c"), "a* b* c*");
+        assert_eq!(fts_match_expr(r#"foo" OR bar"#), r#""foo"* "OR"* "bar"*"#);
+        assert_eq!(fts_match_expr("a-b.c"), r#""a"* "b"* "c"*"#);
         assert_eq!(fts_match_expr("   "), "");
+    }
+
+    #[test]
+    fn fts_operator_words_are_searched_as_words() {
+        let store = open_memory_store();
+        store
+            .index_body("a", "do not rock and roll near here")
+            .unwrap();
+        for term in ["NOT", "and", "rock AND roll", "NEAR"] {
+            assert_eq!(
+                store.search_body(term).unwrap(),
+                vec!["a".to_string()],
+                "{term}"
+            );
+        }
     }
 
     #[test]
