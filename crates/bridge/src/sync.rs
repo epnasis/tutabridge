@@ -390,12 +390,37 @@ impl MailStore {
     }
 }
 
+/// Tells the event handler that the syncer's bootstrap — cache loaded,
+/// folders listed — is over. Events applied before that race it: a folder
+/// load or listing taken earlier overwrites what the handler just did, and
+/// mail vanishes or lands in the wrong folder. Sent on drop too, so an
+/// early return can never leave the handler waiting.
+pub struct BootstrapDone(watch::Sender<bool>);
+
+impl BootstrapDone {
+    pub fn channel() -> (Self, watch::Receiver<bool>) {
+        let (tx, rx) = watch::channel(false);
+        (Self(tx), rx)
+    }
+
+    fn signal(&self) {
+        let _ = self.0.send(true);
+    }
+}
+
+impl Drop for BootstrapDone {
+    fn drop(&mut self) {
+        self.signal();
+    }
+}
+
 pub async fn run_syncer(
     store: Arc<MailStore>,
     local_store: Arc<LocalStore>,
     backend: Arc<dyn MailBackend>,
     sync_limit: usize,
     shutdown: watch::Receiver<bool>,
+    bootstrap_done: BootstrapDone,
 ) {
     info!(
         "Mail syncer started (body prefetch depth={})",
@@ -483,6 +508,7 @@ pub async fn run_syncer(
     } else {
         debug!("Skipping full-metadata sync — already complete, event bus reconciles");
     }
+    bootstrap_done.signal();
 
     // One-time backfill of the full-text body index from bodies that were
     // already cached (downloaded before the index existed). Bodies fetched from
@@ -736,40 +762,32 @@ pub(crate) async fn sync_folder(
         })
         .collect();
 
-    // Allocate stable UIDs for mails we haven't seen before. `new_mails` is
-    // newest-first; reverse the new ones so the oldest gets the lowest UID.
-    let new_element_ids: Vec<String> = new_mails
+    // UIDs come from the persisted per-folder map, not from memory: memory
+    // may not be loaded yet, and the event handler assigns concurrently.
+    // `new_mails` is newest-first; reverse it so the oldest new mail gets the
+    // lowest new UID.
+    let element_ids: Vec<String> = new_mails
         .iter()
         .rev()
         .filter_map(|m| m._id.as_ref().map(|id| id.element_id.to_string()))
-        .filter(|eid| !existing_map.contains_key(eid))
         .collect();
-    let new_uids = if new_element_ids.is_empty() {
-        std::collections::HashMap::new()
-    } else {
-        let refs: Vec<&str> = new_element_ids.iter().map(|s| s.as_str()).collect();
-        local_store
-            .allocate_folder_uids(&folder.id, &refs)
-            .unwrap_or_else(|e| {
-                warn!("Failed to allocate UIDs for {}: {}", folder.imap_path, e);
-                std::collections::HashMap::new()
-            })
-    };
+    let refs: Vec<&str> = element_ids.iter().map(|s| s.as_str()).collect();
+    // Without UIDs nothing can be published; the folder stays as it is
+    // rather than being replaced by an empty one.
+    let uids = local_store
+        .assign_folder_uids(&folder.id, &refs)
+        .map_err(|e| format!("could not assign UIDs: {e}"))?;
 
     let mut updated = Vec::with_capacity(new_mails.len());
     let mut metas_to_upsert = Vec::with_capacity(new_mails.len());
 
     for mail in &new_mails {
         let elem_id = mail._id.as_ref().map(|id| id.element_id.to_string());
-        let uid = elem_id
-            .as_ref()
-            .and_then(|id| {
-                existing_map
-                    .get(id)
-                    .map(|m| m.uid)
-                    .or_else(|| new_uids.get(id).copied())
-            })
-            .unwrap_or(0);
+        // No UID, no message: UID 0 is not valid IMAP. It is listed again on
+        // the next sync.
+        let Some(uid) = elem_id.as_ref().and_then(|id| uids.get(id).copied()) else {
+            continue;
+        };
 
         if let Some(existing) = elem_id.as_ref().and_then(|id| existing_map.get(id)) {
             updated.push(StoredMail {
@@ -1116,7 +1134,7 @@ fn backoff(current: Duration) -> Duration {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tutasdk::date::DateTime;
     use tutasdk::entities::generated::tutanota::MailAddress;
@@ -1129,7 +1147,7 @@ mod tests {
     /// Minimal `Mail` fixture for `MailStore` tests. Only the `_id` and a
     /// couple of metadata fields are read by the helpers under test; the rest
     /// is filled with defaults.
-    fn make_mail(list: &str, element: &str, subject: &str, unread: bool) -> Mail {
+    pub(crate) fn make_mail(list: &str, element: &str, subject: &str, unread: bool) -> Mail {
         Mail {
             _id: Some(IdTupleGenerated::new(id(list), id(element))),
             _permissions: id("perm"),
@@ -1175,7 +1193,7 @@ mod tests {
         }
     }
 
-    fn stored(mail: Mail, uid: u32) -> StoredMail {
+    pub(crate) fn stored(mail: Mail, uid: u32) -> StoredMail {
         StoredMail {
             mail,
             details: None,

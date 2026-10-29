@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension};
 /// Bumped when the on-disk schema changes. A mismatch drops the cached tables
 /// (mails + sync_state + event_bus_state) and triggers a full re-sync;
 /// encrypted .eml files are keyed by element id and survive the migration.
-const SCHEMA_VERSION: &str = "4";
+const SCHEMA_VERSION: &str = "5";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -59,6 +59,79 @@ fn fts_match_expr(term: &str) -> String {
         .join(" ")
 }
 
+/// UIDs are only meaningful together with UIDVALIDITY (RFC 3501 §2.3.1.1):
+/// whenever a folder's UID counter (re)starts, the same UID can name a
+/// different mail, so the folder gets a UIDVALIDITY it never had. Values come
+/// from one store-wide counter (`store_meta.uid_validity`, the last one
+/// issued) that only grows: max(now, previous + 1).
+fn next_uid_validity(previous: Option<u32>) -> u32 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(1);
+    previous.map_or(now, |p| now.max(p.saturating_add(1)))
+}
+
+fn read_uid_validity(conn: &Connection) -> Result<Option<u32>, StoreError> {
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM store_meta WHERE key = 'uid_validity'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(value.and_then(|v| v.parse().ok()))
+}
+
+fn write_uid_validity(conn: &Connection, value: u32) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT OR REPLACE INTO store_meta(key, value) VALUES ('uid_validity', ?1)",
+        [value.to_string()],
+    )?;
+    Ok(())
+}
+
+/// Run `body` in one IMMEDIATE transaction and roll back on any error. The
+/// connection is shared: a transaction left open would make every later
+/// BEGIN fail — and with it every UID assignment — until a restart.
+fn in_transaction<T>(
+    conn: &Connection,
+    body: impl FnOnce() -> Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = body().and_then(|value| {
+        conn.execute_batch("COMMIT")?;
+        Ok(value)
+    });
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    result
+}
+
+fn folder_uid_state(conn: &Connection, folder_id: &str) -> Result<(u32, u32), StoreError> {
+    let state: Option<(u32, u32)> = conn
+        .query_row(
+            "SELECT uid_validity, next_uid FROM sync_state WHERE folder_id = ?1",
+            [folder_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match state {
+        Some((validity, next_uid)) if validity != 0 => Ok((validity, next_uid)),
+        _ => {
+            let validity = next_uid_validity(read_uid_validity(conn)?);
+            write_uid_validity(conn, validity)?;
+            conn.execute(
+                "INSERT INTO sync_state(folder_id, uid_validity) VALUES (?1, ?2)
+                 ON CONFLICT(folder_id) DO UPDATE SET uid_validity = excluded.uid_validity",
+                rusqlite::params![folder_id, validity],
+            )?;
+            Ok((validity, state.map_or(1, |(_, next_uid)| next_uid)))
+        }
+    }
+}
+
 impl LocalStore {
     pub fn open(
         db_path: &Path,
@@ -98,6 +171,7 @@ impl LocalStore {
             conn.execute_batch(
                 "DROP TABLE IF EXISTS mails;
                  DROP TABLE IF EXISTS sync_state;
+                 DROP TABLE IF EXISTS folder_uids;
                  DROP TABLE IF EXISTS event_bus_state;
                  DROP TABLE IF EXISTS mail_fts;",
             )?;
@@ -122,7 +196,14 @@ impl LocalStore {
             CREATE TABLE IF NOT EXISTS sync_state (
                 folder_id     TEXT PRIMARY KEY,
                 last_sync_ms  INTEGER NOT NULL DEFAULT 0,
-                next_uid      INTEGER NOT NULL DEFAULT 1
+                next_uid      INTEGER NOT NULL DEFAULT 1,
+                uid_validity  INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS folder_uids (
+                folder_id   TEXT NOT NULL,
+                element_id  TEXT NOT NULL,
+                uid         INTEGER NOT NULL,
+                PRIMARY KEY (folder_id, element_id)
             );
             CREATE TABLE IF NOT EXISTS event_bus_state (
                 group_id       TEXT PRIMARY KEY,
@@ -144,6 +225,21 @@ impl LocalStore {
             storage_key,
             mails_dir: mails_dir.to_path_buf(),
         })
+    }
+
+    /// `(UIDVALIDITY, UIDNEXT)` of a folder, creating its counter on first
+    /// use. A new counter starts at UID 1 under a UIDVALIDITY never issued
+    /// before, so a folder recreated under an old name, or every folder after
+    /// a schema migration dropped `sync_state`, cannot reuse a client's UIDs.
+    pub fn folder_uid_state(&self, folder_id: &str) -> Result<(u32, u32), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        in_transaction(&conn, || folder_uid_state(&conn, folder_id))
+    }
+
+    /// Run raw SQL, for tests that need the store to fail on cue.
+    #[cfg(test)]
+    pub(crate) fn exec_for_test(&self, sql: &str) {
+        self.conn.lock().unwrap().execute_batch(sql).unwrap();
     }
 
     pub fn verify_key(&self) -> bool {
@@ -180,13 +276,20 @@ impl LocalStore {
     pub fn reset(&self) -> Result<(), StoreError> {
         warn!("Resetting local store — all cached data will be deleted");
         let conn = self.conn.lock().unwrap();
-        conn.execute_batch(&format!(
-            "DELETE FROM mails;
-             DELETE FROM sync_state;
-             DELETE FROM store_meta;
-             DELETE FROM mail_fts;
-             INSERT INTO store_meta(key, value) VALUES ('schema_version', '{SCHEMA_VERSION}');"
-        ))?;
+        // One transaction: losing store_meta's UIDVALIDITY counter between
+        // the wipe and its rewrite could reissue a value a client has seen.
+        in_transaction(&conn, || {
+            let uid_validity = read_uid_validity(&conn)?;
+            conn.execute_batch(&format!(
+                "DELETE FROM mails;
+                 DELETE FROM sync_state;
+                 DELETE FROM folder_uids;
+                 DELETE FROM store_meta;
+                 DELETE FROM mail_fts;
+                 INSERT INTO store_meta(key, value) VALUES ('schema_version', '{SCHEMA_VERSION}');"
+            ))?;
+            write_uid_validity(&conn, next_uid_validity(uid_validity))
+        })?;
         drop(conn);
 
         if self.mails_dir.exists() {
@@ -239,6 +342,7 @@ impl LocalStore {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(element_id) DO UPDATE SET
                 folder_id = excluded.folder_id,
+                uid = excluded.uid,
                 subject = excluded.subject,
                 sender_name = excluded.sender_name,
                 sender_address = excluded.sender_address,
@@ -265,14 +369,14 @@ impl LocalStore {
 
     pub fn upsert_mail_metadata_batch(&self, metas: &[MailMetadata]) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
-        conn.execute_batch("BEGIN IMMEDIATE")?;
-        {
+        in_transaction(&conn, || {
             let mut stmt = conn.prepare_cached(
                 "INSERT INTO mails (element_id, list_id, folder_id, subject, sender_name,
                                     sender_address, received_date_ms, unread, has_details, uid, mail_json)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT(element_id) DO UPDATE SET
                     folder_id = excluded.folder_id,
+                    uid = excluded.uid,
                     subject = excluded.subject,
                     sender_name = excluded.sender_name,
                     sender_address = excluded.sender_address,
@@ -296,42 +400,63 @@ impl LocalStore {
                     meta.mail_json,
                 ])?;
             }
-        }
-        conn.execute_batch("COMMIT")?;
-        Ok(())
+            Ok(())
+        })
     }
 
-    /// Assign stable, monotonic UIDs to the given (new) element ids in a folder.
-    /// UIDs are never reused — the per-folder counter only advances — so an IMAP
-    /// client's `(UIDVALIDITY, UID)` cache stays valid across bridge restarts.
-    /// Ids should be supplied oldest-first so newer mail gets higher UIDs.
-    pub fn allocate_folder_uids(
+    /// The UID of each mail in a folder, assigning the next one to any mail
+    /// the folder does not hold yet. Idempotent and atomic under the store
+    /// lock, so the syncer and the event handler — whichever comes first,
+    /// before or after the cache is loaded — always agree on a mail's UID.
+    /// The counter only advances, so a UID is never reused within a
+    /// UIDVALIDITY. Ids should be supplied oldest-first so newer mail gets
+    /// higher UIDs.
+    pub fn assign_folder_uids(
         &self,
         folder_id: &str,
-        new_element_ids: &[&str],
+        element_ids: &[&str],
     ) -> Result<std::collections::HashMap<String, u32>, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let mut next: i64 = conn
-            .query_row(
-                "SELECT next_uid FROM sync_state WHERE folder_id = ?1",
-                [folder_id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .unwrap_or(1);
+        in_transaction(&conn, || {
+            let (_, mut next) = folder_uid_state(&conn, folder_id)?;
+            let mut map = std::collections::HashMap::with_capacity(element_ids.len());
+            let mut select = conn.prepare_cached(
+                "SELECT uid FROM folder_uids WHERE folder_id = ?1 AND element_id = ?2",
+            )?;
+            let mut insert = conn.prepare_cached(
+                "INSERT INTO folder_uids(folder_id, element_id, uid) VALUES (?1, ?2, ?3)",
+            )?;
+            for eid in element_ids {
+                let held: Option<u32> = select
+                    .query_row(rusqlite::params![folder_id, eid], |row| row.get(0))
+                    .optional()?;
+                let uid = match held {
+                    Some(uid) => uid,
+                    None => {
+                        insert.execute(rusqlite::params![folder_id, eid, next])?;
+                        next += 1;
+                        next - 1
+                    }
+                };
+                map.insert((*eid).to_string(), uid);
+            }
+            conn.execute(
+                "UPDATE sync_state SET next_uid = ?2 WHERE folder_id = ?1",
+                rusqlite::params![folder_id, next],
+            )?;
+            Ok(map)
+        })
+    }
 
-        let mut map = std::collections::HashMap::with_capacity(new_element_ids.len());
-        for eid in new_element_ids {
-            map.insert((*eid).to_string(), next as u32);
-            next += 1;
-        }
-
+    /// Forget a mail's UID in a folder it has left, so that if it comes back
+    /// it is a new arrival with a higher UID (RFC 3501 §2.3.1.1).
+    pub fn release_folder_uid(&self, folder_id: &str, element_id: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO sync_state(folder_id, next_uid) VALUES (?1, ?2)
-             ON CONFLICT(folder_id) DO UPDATE SET next_uid = excluded.next_uid",
-            rusqlite::params![folder_id, next],
+            "DELETE FROM folder_uids WHERE folder_id = ?1 AND element_id = ?2",
+            [folder_id, element_id],
         )?;
-        Ok(map)
+        Ok(())
     }
 
     pub fn delete_mails_not_in(
@@ -358,15 +483,35 @@ impl LocalStore {
             }
         }
 
-        if !deleted.is_empty() {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            {
+        // UIDs held in this folder by mails it no longer lists, including
+        // ones whose row already points at the folder they moved to.
+        let released: Vec<String> = {
+            let mut stmt =
+                conn.prepare("SELECT element_id FROM folder_uids WHERE folder_id = ?1")?;
+            let keep: std::collections::HashSet<&str> = element_ids.iter().copied().collect();
+            let held: Vec<String> = stmt
+                .query_map([folder_id], |row| row.get(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            held.into_iter()
+                .filter(|eid| !keep.contains(eid.as_str()))
+                .collect()
+        };
+
+        if !deleted.is_empty() || !released.is_empty() {
+            in_transaction(&conn, || {
                 let mut stmt = conn.prepare_cached("DELETE FROM mails WHERE element_id = ?1")?;
                 for eid in &deleted {
                     stmt.execute([eid])?;
                 }
-            }
-            conn.execute_batch("COMMIT")?;
+                let mut stmt = conn.prepare_cached(
+                    "DELETE FROM folder_uids WHERE folder_id = ?1 AND element_id = ?2",
+                )?;
+                for eid in &released {
+                    stmt.execute([folder_id, eid.as_str()])?;
+                }
+                Ok(())
+            })?;
         }
 
         Ok(deleted)
@@ -593,9 +738,11 @@ impl LocalStore {
             .query_map([folder_id], |row| row.get::<_, String>(0))?
             .filter_map(|r| r.ok())
             .collect();
-        if !ids.is_empty() {
+        in_transaction(&conn, || {
             conn.execute("DELETE FROM mails WHERE folder_id = ?1", [folder_id])?;
-        }
+            conn.execute("DELETE FROM folder_uids WHERE folder_id = ?1", [folder_id])?;
+            Ok(())
+        })?;
         Ok(ids)
     }
 
@@ -604,7 +751,14 @@ impl LocalStore {
     pub fn delete_mail(&self, element_id: &str) -> Result<(), StoreError> {
         {
             let conn = self.conn.lock().unwrap();
-            conn.execute("DELETE FROM mails WHERE element_id = ?1", [element_id])?;
+            in_transaction(&conn, || {
+                conn.execute("DELETE FROM mails WHERE element_id = ?1", [element_id])?;
+                conn.execute(
+                    "DELETE FROM folder_uids WHERE element_id = ?1",
+                    [element_id],
+                )?;
+                Ok(())
+            })?;
         }
         self.delete_eml(element_id)?;
         self.unindex_body(element_id)?;
@@ -698,17 +852,51 @@ mod tests {
     }
 
     #[test]
-    fn allocate_uids_are_monotonic_and_per_folder() {
+    fn assigned_uids_are_idempotent_monotonic_and_per_folder() {
         let store = open_memory_store();
-        let m1 = store.allocate_folder_uids("inbox", &["a", "b"]).unwrap();
-        assert_eq!(m1["a"], 1);
-        assert_eq!(m1["b"], 2);
-        // Continues, never reuses, even if "a"/"b" were deleted.
-        let m2 = store.allocate_folder_uids("inbox", &["c"]).unwrap();
-        assert_eq!(m2["c"], 3);
+        let m1 = store.assign_folder_uids("inbox", &["a", "b"]).unwrap();
+        assert_eq!((m1["a"], m1["b"]), (1, 2));
+        // A mail the folder already holds keeps its UID.
+        let m2 = store.assign_folder_uids("inbox", &["b", "c"]).unwrap();
+        assert_eq!((m2["b"], m2["c"]), (2, 3));
+        // A mail that left and came back is a new arrival: higher UID.
+        store.release_folder_uid("inbox", "a").unwrap();
+        assert_eq!(store.assign_folder_uids("inbox", &["a"]).unwrap()["a"], 4);
         // Each folder has its own counter.
-        let m3 = store.allocate_folder_uids("custom", &["x"]).unwrap();
-        assert_eq!(m3["x"], 1);
+        assert_eq!(store.assign_folder_uids("custom", &["x"]).unwrap()["x"], 1);
+        assert_eq!(store.folder_uid_state("inbox").unwrap().1, 5);
+    }
+
+    #[test]
+    fn a_moved_mail_persists_its_new_uid() {
+        let store = open_memory_store();
+        let mut m = meta("x", "inbox", 0);
+        m.uid = 3;
+        store.upsert_mail_metadata(&m).unwrap();
+        m.folder_id = "archive".into();
+        m.uid = 4;
+        store.upsert_mail_metadata(&m).unwrap();
+        assert_eq!(store.load_folder_metadata("archive").unwrap()[0].uid, 4);
+        m.uid = 5;
+        store.upsert_mail_metadata_batch(&[m]).unwrap();
+        assert_eq!(store.load_folder_metadata("archive").unwrap()[0].uid, 5);
+    }
+
+    #[test]
+    fn a_sync_that_no_longer_lists_a_mail_releases_its_uid() {
+        let store = open_memory_store();
+        assert_eq!(
+            store.assign_folder_uids("inbox", &["x", "y"]).unwrap()["x"],
+            1
+        );
+        // Its row already moved on with it; the folder's UID map must not
+        // keep the old placement.
+        store
+            .upsert_mail_metadata(&meta("x", "archive", 0))
+            .unwrap();
+        store.delete_mails_not_in("inbox", &["y"]).unwrap();
+        assert_eq!(store.assign_folder_uids("inbox", &["x"]).unwrap()["x"], 3);
+        assert_eq!(store.assign_folder_uids("inbox", &["y"]).unwrap()["y"], 2);
     }
 
     #[test]
@@ -894,5 +1082,62 @@ mod tests {
 
         store.mark_has_details("det").unwrap();
         assert!(store.load_folder_metadata("inbox").unwrap()[0].has_details);
+    }
+
+    #[test]
+    fn uid_validity_is_per_folder_and_changes_when_its_counter_restarts() {
+        let key = test_key();
+        let tmp_dir =
+            std::env::temp_dir().join(format!("tutabridge_test_{}", rand::random::<u64>()));
+        let db_path = tmp_dir.join("test.db");
+        let mails_dir = tmp_dir.join("mails");
+
+        let store = LocalStore::open(&db_path, &mails_dir, key.clone()).unwrap();
+        let (inbox, next) = store.folder_uid_state("inbox").unwrap();
+        assert!(inbox > 1);
+        assert_eq!(next, 1);
+        // A folder created later (a recreated folder has a new id) gets a
+        // value no folder had before.
+        let (custom, _) = store.folder_uid_state("custom").unwrap();
+        assert!(custom > inbox);
+        drop(store);
+
+        // A plain restart keeps it: the UIDs it vouches for are unchanged.
+        let store = LocalStore::open(&db_path, &mails_dir, key.clone()).unwrap();
+        assert_eq!(store.folder_uid_state("inbox").unwrap().0, inbox);
+
+        // A schema migration drops sync_state, so UIDs restart from 1.
+        store.set_meta("schema_version", "0").unwrap();
+        drop(store);
+        let store = LocalStore::open(&db_path, &mails_dir, key.clone()).unwrap();
+        let (after_migration, next) = store.folder_uid_state("inbox").unwrap();
+        assert!(after_migration > custom);
+        assert_eq!(next, 1);
+
+        // So does a reset.
+        store.reset().unwrap();
+        assert!(store.folder_uid_state("inbox").unwrap().0 > after_migration);
+    }
+
+    #[test]
+    fn uid_validity_only_grows() {
+        assert_eq!(next_uid_validity(Some(u32::MAX - 1)), u32::MAX);
+        let now = next_uid_validity(None);
+        assert!(next_uid_validity(Some(now)) > now);
+    }
+
+    #[test]
+    fn a_failed_batch_leaves_no_transaction_open() {
+        let store = open_memory_store();
+        {
+            let conn = store.conn.lock().unwrap();
+            let failed = in_transaction(&conn, || {
+                conn.execute("INSERT INTO no_such_table VALUES (1)", [])?;
+                Ok(())
+            });
+            assert!(failed.is_err());
+        }
+        // The next transaction, and so UID assignment, still works.
+        assert_eq!(store.assign_folder_uids("inbox", &["a"]).unwrap()["a"], 1);
     }
 }

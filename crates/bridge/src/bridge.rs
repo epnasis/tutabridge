@@ -347,12 +347,14 @@ impl BridgeHandle {
             // mpsc channel from event bus -> handler.
             let (event_tx, event_rx) = tokio::sync::mpsc::channel(64);
 
+            let (bootstrap_done, bootstrap_done_rx) = sync::BootstrapDone::channel();
             let syncer_handle = tokio::spawn(sync::run_syncer(
                 store.clone(),
                 local_store.clone(),
                 backend.clone(),
                 sync_limit,
                 shutdown_sync_rx.clone(),
+                bootstrap_done,
             ));
             let bus_handle = {
                 let client = Arc::clone(&bus_client);
@@ -375,6 +377,7 @@ impl BridgeHandle {
                 bus_ids_for_handler,
                 event_rx,
                 shutdown_sync_rx.clone(),
+                bootstrap_done_rx,
             ));
             let mut imap_handle = tokio::spawn(imap::serve(
                 imap_port,
