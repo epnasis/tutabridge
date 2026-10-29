@@ -404,7 +404,8 @@ impl LocalStore {
                 sender_address = excluded.sender_address,
                 received_date_ms = excluded.received_date_ms,
                 unread = excluded.unread,
-                has_details = excluded.has_details,
+                -- Never cleared here: the body may already be on disk.
+                has_details = CASE WHEN excluded.has_details = 1 THEN 1 ELSE mails.has_details END,
                 mail_json = excluded.mail_json",
             rusqlite::params![
                 meta.element_id,
@@ -941,6 +942,16 @@ mod tests {
         // Each folder has its own counter.
         assert_eq!(store.assign_folder_uids("custom", &["x"]).unwrap()["x"], 1);
         assert_eq!(store.folder_uid_state("inbox").unwrap().1, 5);
+    }
+
+    #[test]
+    fn an_upsert_never_clears_has_details() {
+        let store = open_memory_store();
+        store.upsert_mail_metadata(&meta("x", "inbox", 0)).unwrap();
+        store.mark_has_details("x").unwrap();
+        // A later metadata refresh says nothing about the body on disk.
+        store.upsert_mail_metadata(&meta("x", "inbox", 0)).unwrap();
+        assert!(store.load_folder_metadata("inbox").unwrap()[0].has_details);
     }
 
     #[test]

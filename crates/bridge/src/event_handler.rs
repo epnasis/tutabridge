@@ -225,9 +225,9 @@ fn bucket_updates(updates: &[EntityUpdateEvent]) -> Bucketed<'_> {
 /// before the matching MailSetEntry CREATE runs. `details` is only set
 /// when the server also bundled `event.blob_instance` (it's `None` on
 /// drafts and on legacy events).
-struct PendingMail {
-    mail: tutasdk::entities::generated::tutanota::Mail,
-    details: Option<tutasdk::entities::generated::tutanota::MailDetails>,
+pub(crate) struct PendingMail {
+    pub(crate) mail: tutasdk::entities::generated::tutanota::Mail,
+    pub(crate) details: Option<tutasdk::entities::generated::tutanota::MailDetails>,
 }
 
 async fn apply_batch(
@@ -357,7 +357,7 @@ async fn refresh_folder_list(
     }
 }
 
-async fn apply_mail_set_entry_create(
+pub(crate) async fn apply_mail_set_entry_create(
     store: &MailStore,
     local_store: &LocalStore,
     backend: &dyn MailBackend,
@@ -436,17 +436,19 @@ async fn apply_mail_set_entry_create(
             uid: 0,
             attachments_pending: false,
         };
+        if !assign_uid_and_upsert(store, local_store, target_folder, &mail_eid, &mut stored).await {
+            fallback_folders.insert(ev.instance_list_id.clone());
+            return;
+        }
         // Persist the body straight away so the IMAP layer can serve FETCH
-        // BODY[] without a placeholder, and the prefetch loop skips it.
+        // BODY[] without a placeholder, and the prefetch loop skips it. After
+        // the upsert: before it, a new mail has no row for the flag to land in.
         if let Some(eml) = rfc2822.as_deref() {
             if let Err(e) = local_store.write_eml(&mail_eid, eml) {
                 warn!("Failed to cache eml for {}: {e}", mail_eid);
             } else if let Err(e) = local_store.mark_has_details(&mail_eid) {
                 warn!("Failed to mark has_details for {}: {e}", mail_eid);
             }
-        }
-        if !assign_uid_and_upsert(store, local_store, target_folder, &mail_eid, &mut stored).await {
-            fallback_folders.insert(ev.instance_list_id.clone());
         }
         return;
     }

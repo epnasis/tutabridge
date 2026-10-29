@@ -535,7 +535,11 @@ impl ImapSession {
                                         eid,
                                         details.clone(),
                                         rfc.clone(),
-                                        false,
+                                        // The syncer's attachment retry pass
+                                        // picks it up; without the flag the
+                                        // attachments stay missing until a
+                                        // restart.
+                                        !attachments_complete,
                                     )
                                     .await;
                             }
@@ -2600,7 +2604,12 @@ mod tests {
     /// real `LocalStore`; returns the FETCH response, the backend and the store.
     async fn on_demand_fetch(
         fail_attachments: bool,
-    ) -> (Vec<String>, Arc<MockBackend>, Arc<LocalStore>) {
+    ) -> (
+        Vec<String>,
+        Arc<MockBackend>,
+        Arc<LocalStore>,
+        Arc<MailStore>,
+    ) {
         use crypto_primitives::aes::Aes256Key;
         use crypto_primitives::key::GenericAesKey;
         use crypto_primitives::randomizer_facade::RandomizerFacade;
@@ -2633,16 +2642,21 @@ mod tests {
                 }],
             )
             .await;
-        let mut session = ImapSession::new(store, backend.clone(), None, Some(local_store.clone()));
+        let mut session = ImapSession::new(
+            store.clone(),
+            backend.clone(),
+            None,
+            Some(local_store.clone()),
+        );
         session.handle_command("a LOGIN u p").await;
         session.handle_command("b SELECT INBOX").await;
         let resp = session.handle_command("c UID FETCH 1 (BODY.PEEK[])").await;
-        (resp, backend, local_store)
+        (resp, backend, local_store, store)
     }
 
     #[tokio::test]
     async fn on_demand_body_fetch_persists_and_indexes_the_rendition() {
-        let (resp, backend, local_store) = on_demand_fetch(false).await;
+        let (resp, backend, local_store, _) = on_demand_fetch(false).await;
         assert!(resp.last().unwrap().contains("OK"), "{resp:?}");
         assert!(
             resp[0].contains("BODY[] {") && resp[0].contains("\r\nX-Tutabridge-Authentication: "),
@@ -2662,12 +2676,65 @@ mod tests {
 
     #[tokio::test]
     async fn on_demand_body_fetch_with_failed_attachments_is_not_persisted() {
-        let (resp, _, local_store) = on_demand_fetch(true).await;
+        let (resp, _, local_store, store) = on_demand_fetch(true).await;
         assert!(resp.last().unwrap().contains("OK"), "{resp:?}");
         // Served from memory, but not written: on disk, prefetch would take
         // it as done and the attachments would never be retried.
         assert!(!local_store.has_eml("od"));
         assert!(!local_store.load_folder_metadata("inbox").unwrap()[0].has_details);
+        // Flagged for the syncer's attachment retry pass.
+        assert!(store.get_folder("inbox").await[0].attachments_pending);
+    }
+
+    #[tokio::test]
+    async fn an_inline_create_keeps_its_body_flag() {
+        use crate::event_handler::{apply_mail_set_entry_create, PendingMail};
+        use tutasdk::event_bus::{EntityUpdateEvent, Operation};
+
+        let local_store = temp_local_store();
+        let mail_id = "KjlO6iI----0";
+        let mail = make_mail(mail_id, "s", true);
+        let backend = Arc::new(MockBackend::with_mails(vec![]));
+        let store = MailStore::new();
+        let inbox = inbox_folder();
+        let folder_by_entries: std::collections::HashMap<&str, &FolderInfo> =
+            [(inbox.entries_list_id.as_str(), &inbox)]
+                .into_iter()
+                .collect();
+        let mut pending = std::collections::HashMap::from([(
+            mail_id.to_string(),
+            PendingMail {
+                mail,
+                details: Some(make_details("<p>inline body</p>")),
+            },
+        )]);
+        let entry = tutasdk::mail_set_entry_id::construct(
+            tutasdk::date::DateTime::from_millis(1_700_000_000_000),
+            &GeneratedId(mail_id.to_string()),
+        );
+        let ev = EntityUpdateEvent {
+            application: "tutanota".to_string(),
+            type_id: 0,
+            instance_list_id: inbox.entries_list_id.clone(),
+            instance_id: entry.0,
+            operation: Operation::Create,
+            instance: None,
+            blob_instance: None,
+        };
+        apply_mail_set_entry_create(
+            &store,
+            &local_store,
+            &*backend,
+            &folder_by_entries,
+            &mut std::collections::HashSet::new(),
+            &mut pending,
+            &ev,
+        )
+        .await;
+
+        assert!(local_store.has_eml(mail_id));
+        // The flag must land on the row the upsert created, not before it.
+        assert!(local_store.load_folder_metadata("inbox").unwrap()[0].has_details);
     }
 
     #[tokio::test]
