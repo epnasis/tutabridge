@@ -199,6 +199,29 @@ impl ImapSession {
         responses
     }
 
+    /// `(UIDVALIDITY, UIDNEXT)` of a folder. Both come from its persisted
+    /// counter, which every UID was assigned from; `memory_next` (one past
+    /// the highest UID loaded) only guards against a store that lags. Without
+    /// a local store (tests) UIDs never outlive the process, so a constant
+    /// UIDVALIDITY is as good as any.
+    ///
+    /// A store error is an error, not a guess: a made-up UIDVALIDITY would make
+    /// a client drop its cache now and again when the real one returns.
+    fn uid_state(&self, folder_id: &str, memory_next: u32) -> Result<(u32, u32), String> {
+        match self
+            .local_store
+            .as_ref()
+            .map(|local_store| local_store.folder_uid_state(folder_id))
+        {
+            Some(Ok((validity, next))) => Ok((validity, next.max(memory_next))),
+            Some(Err(e)) => {
+                log::warn!("UID state of {folder_id} unavailable: {e}");
+                Err(e.to_string())
+            }
+            None => Ok((1, memory_next)),
+        }
+    }
+
     pub async fn handle_command(&mut self, line: &str) -> Vec<String> {
         let (tag, cmd, args) = parse_command(line);
 
@@ -333,6 +356,8 @@ impl ImapSession {
         let folder_id = folder.id.clone();
         self.selected_folder = Some(folder);
         self.state = State::Selected;
+        // UIDNEXT is per mailbox: the previous one's must not carry over.
+        self.uid_next = 1;
 
         match self.refresh_mails(&folder_id).await {
             Ok(()) => {
@@ -345,13 +370,23 @@ impl ImapSession {
                     .unwrap_or(0);
 
                 let labels = self.store.label_registry().await;
+                let (uid_validity, uid_next) = match self.uid_state(&folder_id, self.uid_next) {
+                    Ok(state) => state,
+                    Err(_) => {
+                        self.selected_folder = None;
+                        self.state = State::Authenticated;
+                        return vec![format!(
+                            "{tag} NO [UNAVAILABLE] mailbox UID state could not be read (see the bridge log)\r\n"
+                        )];
+                    }
+                };
                 let mut resp = vec![
                     format!("* {} EXISTS\r\n", count),
                     "* 0 RECENT\r\n".to_string(),
                     flags_advertisement(&labels),
                     permanent_flags_advertisement(&labels),
-                    "* OK [UIDVALIDITY 1] UIDs valid\r\n".to_string(),
-                    format!("* OK [UIDNEXT {}] Predicted next UID\r\n", self.uid_next),
+                    format!("* OK [UIDVALIDITY {uid_validity}] UIDs valid\r\n"),
+                    format!("* OK [UIDNEXT {uid_next}] Predicted next UID\r\n"),
                 ];
                 if first_unseen > 0 {
                     resp.push(format!("* OK [UNSEEN {}] First unseen\r\n", first_unseen));
@@ -376,16 +411,23 @@ impl ImapSession {
         }
         let (raw_name, _) = parse_imap_token(args.trim());
         let folder_name = super::utf7::decode(&raw_name).unwrap_or_else(|| raw_name.clone());
-        let stored = match self.store.folder_by_imap_path(&folder_name).await {
-            Some(folder) => self.store.get_folder(&folder.id).await,
-            None => Vec::new(),
+        let Some(folder) = self.store.folder_by_imap_path(&folder_name).await else {
+            return vec![format!("{tag} NO [NONEXISTENT] Mailbox does not exist\r\n")];
         };
+        let stored = self.store.get_folder(&folder.id).await;
         let count = stored.len();
         let unseen = stored.iter().filter(|m| m.mail.unread).count();
+        // The asked-for mailbox's own state, not the selected one's.
+        let memory_next = stored.iter().map(|m| m.uid + 1).max().unwrap_or(1);
+        let Ok((uid_validity, uid_next)) = self.uid_state(&folder.id, memory_next) else {
+            return vec![format!(
+                "{tag} NO [UNAVAILABLE] mailbox UID state could not be read (see the bridge log)\r\n"
+            )];
+        };
         vec![
             format!(
-                "* STATUS \"{}\" (MESSAGES {} UNSEEN {} RECENT 0 UIDNEXT {} UIDVALIDITY 1)\r\n",
-                raw_name, count, unseen, self.uid_next
+                "* STATUS \"{}\" (MESSAGES {} UNSEEN {} RECENT 0 UIDNEXT {} UIDVALIDITY {})\r\n",
+                raw_name, count, unseen, uid_next, uid_validity
             ),
             format!("{} OK STATUS completed\r\n", tag),
         ]
@@ -2183,6 +2225,259 @@ mod tests {
             imap_path: "INBOX".to_string(),
             special_use: None,
         }
+    }
+
+    #[tokio::test]
+    async fn select_and_status_serve_the_stored_uid_validity() {
+        use crypto_primitives::aes::Aes256Key;
+        use crypto_primitives::key::GenericAesKey;
+        use crypto_primitives::randomizer_facade::RandomizerFacade;
+
+        let tmp = std::env::temp_dir().join(format!("tutabridge_test_{}", rand::random::<u64>()));
+        let key = GenericAesKey::Aes256(Aes256Key::generate(&RandomizerFacade::from_core(
+            rand_core::OsRng,
+        )));
+        let local_store =
+            Arc::new(LocalStore::open(&tmp.join("s.db"), &tmp.join("mails"), key).unwrap());
+        let (validity, _) = local_store.folder_uid_state("inbox").unwrap();
+        local_store.assign_folder_uids("inbox", &["e1"]).unwrap();
+
+        let backend = Arc::new(MockBackend::with_mails(vec![make_mail("e1", "s", true)]));
+        let store = MailStore::new();
+        store.set_folder_list(vec![inbox_folder()]).await;
+        let mut session = ImapSession::new(store, backend, None, Some(local_store));
+        session.handle_command("a LOGIN u p").await;
+        let resp = session.handle_command("b SELECT INBOX").await;
+        assert!(
+            resp.iter()
+                .any(|r| r.contains(&format!("[UIDVALIDITY {validity}]"))),
+            "{resp:?}"
+        );
+        let resp = session.handle_command("c STATUS INBOX (UIDVALIDITY)").await;
+        assert!(
+            resp[0].contains(&format!("UIDNEXT 2 UIDVALIDITY {validity})")),
+            "{resp:?}"
+        );
+    }
+
+    fn temp_local_store() -> Arc<LocalStore> {
+        use crypto_primitives::aes::Aes256Key;
+        use crypto_primitives::key::GenericAesKey;
+        use crypto_primitives::randomizer_facade::RandomizerFacade;
+
+        let tmp = std::env::temp_dir().join(format!("tutabridge_test_{}", rand::random::<u64>()));
+        let key = GenericAesKey::Aes256(Aes256Key::generate(&RandomizerFacade::from_core(
+            rand_core::OsRng,
+        )));
+        Arc::new(LocalStore::open(&tmp.join("s.db"), &tmp.join("mails"), key).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_failed_uid_assignment_leaves_the_folder_as_it_was() {
+        let local_store = temp_local_store();
+        let mails = vec![make_mail("e1", "s", true), make_mail("e2", "s", true)];
+        let backend = Arc::new(MockBackend::with_mails(mails.clone()));
+        let store = MailStore::new();
+        populate_store(&store, &mails[..1]).await;
+
+        // A transaction someone else holds open makes the assignment's
+        // BEGIN fail.
+        local_store.exec_for_test("BEGIN");
+        let result =
+            crate::sync::sync_folder(&store, &local_store, &*backend, &inbox_folder()).await;
+        local_store.exec_for_test("ROLLBACK");
+
+        assert!(result.is_err());
+        let held = store.get_folder("inbox").await;
+        assert_eq!(held.len(), 1, "the folder must not be emptied");
+        assert_eq!(held[0].uid, 1);
+    }
+
+    #[tokio::test]
+    async fn select_and_status_answer_no_when_the_uid_state_is_unreadable() {
+        let local_store = temp_local_store();
+        local_store.exec_for_test("DROP TABLE sync_state");
+        let backend = Arc::new(MockBackend::with_mails(vec![]));
+        let store = MailStore::new();
+        store.set_folder_list(vec![inbox_folder()]).await;
+        let mut session = ImapSession::new(store, backend, None, Some(local_store));
+        session.handle_command("a LOGIN u p").await;
+
+        let resp = session.handle_command("b SELECT INBOX").await;
+        assert!(resp[0].starts_with("b NO [UNAVAILABLE]"), "{resp:?}");
+        let resp = session.handle_command("c FETCH 1 (FLAGS)").await;
+        assert!(
+            resp[0].starts_with("c NO"),
+            "SELECT failed, so nothing is selected: {resp:?}"
+        );
+        let resp = session.handle_command("d STATUS INBOX (UIDVALIDITY)").await;
+        assert!(resp[0].starts_with("d NO [UNAVAILABLE]"), "{resp:?}");
+    }
+
+    #[tokio::test]
+    async fn events_wait_for_the_syncer_bootstrap() {
+        use tutasdk::event_bus::{
+            EntityUpdateBatch, EntityUpdateEvent, EventBusMessage, Operation,
+        };
+
+        let local_store = temp_local_store();
+        let mails = vec![make_mail("m1", "s", true)];
+        let backend = Arc::new(MockBackend::with_mails(mails.clone()));
+        let store = MailStore::new();
+        populate_store(&store, &mails).await;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (bootstrap_done, bootstrap_rx) = crate::sync::BootstrapDone::channel();
+        let bus_ids = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let handler = tokio::spawn(crate::event_handler::run_event_handler(
+            store.clone(),
+            local_store.clone(),
+            backend,
+            bus_ids.clone(),
+            rx,
+            shutdown_rx,
+            bootstrap_rx,
+        ));
+        let delete_m1 = EventBusMessage::EntityUpdate(EntityUpdateBatch {
+            batch_id: "b1".to_string(),
+            group_id: "g".to_string(),
+            updates: vec![EntityUpdateEvent {
+                application: "tutanota".to_string(),
+                type_id: 97, // Mail
+                instance_list_id: "L".to_string(),
+                instance_id: "m1".to_string(),
+                operation: Operation::Delete,
+                instance: None,
+                blob_instance: None,
+            }],
+        });
+        tx.send(delete_m1).await.unwrap();
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            store.get_folder("inbox").await.len(),
+            1,
+            "applied before bootstrap"
+        );
+        // Held, yet a reconnect resumes after it; only the persisted id waits.
+        assert_eq!(
+            bus_ids.lock().unwrap().get("g").map(String::as_str),
+            Some("b1")
+        );
+        assert!(local_store.load_event_bus_state().unwrap().is_empty());
+
+        drop(bootstrap_done);
+        for _ in 0..200 {
+            if store.get_folder("inbox").await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            store.get_folder("inbox").await.is_empty(),
+            "held event never applied"
+        );
+        drop(tx);
+        handler.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn events_stop_waiting_once_too_many_are_held() {
+        use tutasdk::event_bus::{
+            EntityUpdateBatch, EntityUpdateEvent, EventBusMessage, Operation,
+        };
+
+        let mails = vec![make_mail("m1", "s", true)];
+        let backend = Arc::new(MockBackend::with_mails(mails.clone()));
+        let store = MailStore::new();
+        populate_store(&store, &mails).await;
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        // Bootstrap never ends.
+        let (_bootstrap_done, bootstrap_rx) = crate::sync::BootstrapDone::channel();
+        let handler = tokio::spawn(crate::event_handler::run_event_handler(
+            store.clone(),
+            temp_local_store(),
+            backend,
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            rx,
+            shutdown_rx,
+            bootstrap_rx,
+        ));
+        // Other bus messages are not held, so they do not count.
+        for _ in 0..crate::event_handler::BOOTSTRAP_HOLD_LIMIT {
+            tx.send(EventBusMessage::InitialSyncDone).await.unwrap();
+        }
+        for n in 0..crate::event_handler::BOOTSTRAP_HOLD_LIMIT - 1 {
+            tx.send(EventBusMessage::EntityUpdate(EntityUpdateBatch {
+                batch_id: format!("empty{n}"),
+                group_id: "g".to_string(),
+                updates: vec![],
+            }))
+            .await
+            .unwrap();
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(
+            store.get_folder("inbox").await.len(),
+            1,
+            "gave up too early"
+        );
+        tx.send(EventBusMessage::EntityUpdate(EntityUpdateBatch {
+            batch_id: "b1".to_string(),
+            group_id: "g".to_string(),
+            updates: vec![EntityUpdateEvent {
+                application: "tutanota".to_string(),
+                type_id: 97, // Mail
+                instance_list_id: "L".to_string(),
+                instance_id: "m1".to_string(),
+                operation: Operation::Delete,
+                instance: None,
+                blob_instance: None,
+            }],
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+        handler.await.unwrap();
+        assert!(store.get_folder("inbox").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn status_reports_the_asked_mailbox_not_the_selected_one() {
+        let backend = Arc::new(MockBackend::with_mails(vec![]));
+        let store = MailStore::new();
+        let work = FolderInfo {
+            id: "work".to_string(),
+            list_id: "folders".to_string(),
+            entries_list_id: "work_entries".to_string(),
+            kind: MailSetKind::Custom,
+            imap_path: "Work".to_string(),
+            special_use: None,
+        };
+        store.set_folder_list(vec![inbox_folder(), work]).await;
+        let high = |eid: &str, uid| StoredMail {
+            mail: make_mail(eid, "s", true),
+            details: None,
+            rfc2822: None,
+            uid,
+            attachments_pending: false,
+        };
+        store.set_folder("inbox", vec![high("i1", 40)]).await;
+        store.set_folder("work", vec![high("w1", 7)]).await;
+        let mut session = ImapSession::new(store, backend, None, None);
+        session.handle_command("a LOGIN u p").await;
+        session.handle_command("b SELECT INBOX").await;
+
+        let resp = session.handle_command("c STATUS Work (UIDNEXT)").await;
+        assert!(resp[0].contains("UIDNEXT 8 "), "{resp:?}");
+        // Nor does SELECT carry INBOX's UIDNEXT over.
+        let resp = session.handle_command("d SELECT Work").await;
+        assert!(resp.iter().any(|r| r.contains("[UIDNEXT 8]")), "{resp:?}");
+        let resp = session.handle_command("e STATUS Nope (UIDNEXT)").await;
+        assert!(resp[0].starts_with("e NO [NONEXISTENT]"), "{resp:?}");
     }
 
     #[tokio::test]

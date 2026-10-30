@@ -29,6 +29,12 @@ use crate::store::LocalStore;
 use crate::sync::{sync_folder, MailStore, StoredMail};
 use crate::tuta::{FolderInfo, MailBackend};
 
+/// Bounds on holding events for the syncer's bootstrap. Past either one they
+/// are applied anyway: the races the hold prevents are back, but a hung
+/// request must not freeze mail forever, nor buffer events without end.
+const BOOTSTRAP_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+pub(crate) const BOOTSTRAP_HOLD_LIMIT: usize = 10_000;
+
 /// Application tag for Tuta's mail-side entities.
 const TUTANOTA_APP: &str = "tutanota";
 /// `Mail` entity (see `tuta-sdk/.../entities/generated/tutanota.rs`,
@@ -47,8 +53,67 @@ pub async fn run_event_handler(
     last_batch_ids: Arc<Mutex<HashMap<String, String>>>,
     mut rx: mpsc::Receiver<EventBusMessage>,
     mut shutdown: watch::Receiver<bool>,
+    mut bootstrap_done: watch::Receiver<bool>,
 ) {
     info!("Event handler started");
+    // Hold events until the syncer's bootstrap is over (see
+    // `BootstrapDone`), but keep reading them: a bus that cannot hand off
+    // its events stalls, and may drop the connection.
+    let mut held = Vec::new();
+    let mut passthrough = None;
+    let give_up = tokio::time::sleep(BOOTSTRAP_WAIT_LIMIT);
+    tokio::pin!(give_up);
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => return,
+            _ = bootstrap_done.wait_for(|done| *done) => break,
+            _ = &mut give_up => {
+                warn!(
+                    "Syncer bootstrap still running after {BOOTSTRAP_WAIT_LIMIT:?}; \
+                     applying events anyway"
+                );
+                break;
+            }
+            msg = rx.recv() => match msg {
+                // Only entity batches touch mail state; the rest are no-ops
+                // here and need not wait.
+                Some(EventBusMessage::EntityUpdate(batch)) => {
+                    // A held batch is received: a reconnect must resume after
+                    // it, not before (or, on a first start, from nowhere).
+                    // Only the persisted id waits until it is applied.
+                    crate::util::lock_recover(&last_batch_ids)
+                        .insert(batch.group_id.clone(), batch.batch_id.clone());
+                    held.push(batch);
+                    if held.len() >= BOOTSTRAP_HOLD_LIMIT {
+                        warn!(
+                            "{BOOTSTRAP_HOLD_LIMIT} event batches held during bootstrap; \
+                             applying them now"
+                        );
+                        break;
+                    }
+                }
+                Some(other) => passthrough = Some(other),
+                None => return,
+            },
+        }
+        // Outside the select: its output borrows the watch channel, which
+        // must not be held across an await.
+        if let Some(other) = passthrough.take() {
+            process(&store, &local_store, &*backend, &last_batch_ids, other).await;
+        }
+    }
+    if !held.is_empty() {
+        debug!(
+            "Applying {} event batches held during bootstrap",
+            held.len()
+        );
+    }
+    for batch in held {
+        // The in-memory id is already past every held batch; replaying must
+        // not wind it back, or a reconnect mid-replay asks for them again.
+        apply_and_persist(&store, &local_store, &*backend, &batch).await;
+    }
     loop {
         tokio::select! {
             biased;
@@ -80,15 +145,21 @@ async fn process(
         _ => return,
     };
 
-    apply_batch(store, local_store, backend, &batch).await;
+    // Advance the in-memory catch-up state (it drives the next reconnect's
+    // query string), then apply and persist (the on-disk row survives bridge
+    // restarts).
+    crate::util::lock_recover(last_batch_ids)
+        .insert(batch.group_id.clone(), batch.batch_id.clone());
+    apply_and_persist(store, local_store, backend, &batch).await;
+}
 
-    // Advance the in-memory catch-up state and persist it. The two must stay
-    // in sync — the in-memory map drives the next reconnect's query string,
-    // the on-disk row survives bridge restarts.
-    {
-        let mut ids = crate::util::lock_recover(last_batch_ids);
-        ids.insert(batch.group_id.clone(), batch.batch_id.clone());
-    }
+async fn apply_and_persist(
+    store: &MailStore,
+    local_store: &LocalStore,
+    backend: &dyn MailBackend,
+    batch: &EntityUpdateBatch,
+) {
+    apply_batch(store, local_store, backend, batch).await;
     if let Err(e) = local_store.set_event_bus_batch_id(&batch.group_id, &batch.batch_id) {
         warn!(
             "Failed to persist last batch id for {}: {}",
@@ -323,7 +394,9 @@ async fn apply_mail_set_entry_create(
             "Event bus: cloning mail {} from {} → {} (no REST)",
             mail_eid, source_folder, target_folder.imap_path
         );
-        assign_uid_and_upsert(store, local_store, target_folder, &mail_eid, &mut stored).await;
+        if !assign_uid_and_upsert(store, local_store, target_folder, &mail_eid, &mut stored).await {
+            fallback_folders.insert(ev.instance_list_id.clone());
+        }
         return;
     }
 
@@ -372,7 +445,9 @@ async fn apply_mail_set_entry_create(
                 warn!("Failed to mark has_details for {}: {e}", mail_eid);
             }
         }
-        assign_uid_and_upsert(store, local_store, target_folder, &mail_eid, &mut stored).await;
+        if !assign_uid_and_upsert(store, local_store, target_folder, &mail_eid, &mut stored).await {
+            fallback_folders.insert(ev.instance_list_id.clone());
+        }
         return;
     }
 
@@ -403,7 +478,11 @@ async fn apply_mail_set_entry_create(
                 uid: 0,
                 attachments_pending: false,
             };
-            assign_uid_and_upsert(store, local_store, target_folder, &elem_id, &mut stored).await;
+            if !assign_uid_and_upsert(store, local_store, target_folder, &elem_id, &mut stored)
+                .await
+            {
+                fallback_folders.insert(ev.instance_list_id.clone());
+            }
         }
         Ok(None) => {
             debug!("MailSetEntry CREATE: mail {} not found on server", elem_id);
@@ -464,6 +543,12 @@ async fn apply_mail_set_entry_delete(
     let removed = store
         .remove_mail_from_folder(&source_folder.id, &mail_eid)
         .await;
+    if let Err(e) = local_store.release_folder_uid(&source_folder.id, &mail_eid) {
+        warn!(
+            "Failed to release UID of {} in {}: {e}",
+            mail_eid, source_folder.imap_path
+        );
+    }
     if removed {
         debug!(
             "Event bus: removed mail {} from {} (no REST)",
@@ -613,23 +698,32 @@ async fn resolve_mail(
     }
 }
 
-/// Allocate a fresh UID in `target_folder`, stamp it on `stored`, then
-/// upsert both `MailStore` and the `LocalStore` metadata row in one step.
+/// Stamp `stored` with its UID in `target_folder`, then upsert both
+/// `MailStore` and the `LocalStore` metadata row in one step.
+///
+/// The UID comes from the persisted per-folder map, so a CREATE for a
+/// placement already held (an event replayed over the bootstrap sync, before
+/// or after the cache is loaded) keeps the UID it has; a new placement gets
+/// the next one. Without a UID the mail is not published at all, and
+/// `false` tells the caller to queue a fallback sync of the folder.
 async fn assign_uid_and_upsert(
     store: &MailStore,
     local_store: &LocalStore,
     target_folder: &FolderInfo,
     mail_eid: &str,
     stored: &mut StoredMail,
-) {
-    let uid = match local_store.allocate_folder_uids(&target_folder.id, &[mail_eid]) {
-        Ok(map) => map.get(mail_eid).copied().unwrap_or(0),
+) -> bool {
+    let uid = match local_store.assign_folder_uids(&target_folder.id, &[mail_eid]) {
+        Ok(map) => match map.get(mail_eid) {
+            Some(&uid) => uid,
+            None => return false,
+        },
         Err(e) => {
             warn!(
-                "Failed to allocate UID for {} in {}: {e}",
+                "Failed to assign UID for {} in {}: {e}",
                 mail_eid, target_folder.imap_path
             );
-            0
+            return false;
         }
     };
     stored.uid = uid;
@@ -645,11 +739,99 @@ async fn assign_uid_and_upsert(
     store
         .upsert_mail_in_folder(&target_folder.id, stored.clone())
         .await;
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_create_for_a_placement_already_held_keeps_its_uid() {
+        use crate::sync::tests::{make_mail, stored};
+        use crypto_primitives::aes::Aes256Key;
+        use crypto_primitives::key::GenericAesKey;
+        use crypto_primitives::randomizer_facade::RandomizerFacade;
+
+        let tmp = std::env::temp_dir().join(format!("tutabridge_test_{}", rand::random::<u64>()));
+        let key = GenericAesKey::Aes256(Aes256Key::generate(&RandomizerFacade::from_core(
+            rand_core::OsRng,
+        )));
+        let local_store = LocalStore::open(&tmp.join("s.db"), &tmp.join("mails"), key).unwrap();
+        let inbox = FolderInfo {
+            id: "inbox".to_string(),
+            list_id: "folders".to_string(),
+            entries_list_id: "inbox_entries".to_string(),
+            kind: tutasdk::folder_system::MailSetKind::Inbox,
+            imap_path: "INBOX".to_string(),
+            special_use: None,
+        };
+        // UIDs 1..=5 already handed out in this folder and persisted.
+        let ids: Vec<String> = (1..=5).map(|i| format!("e{i}")).collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        local_store.assign_folder_uids("inbox", &refs).unwrap();
+
+        // A replayed CREATE before the cache is loaded: memory is empty, the
+        // persisted map still knows the placement.
+        let store = MailStore::new();
+        let mail = make_mail("L", "e3", "s", true);
+        let mut replayed = stored(mail.clone(), 0);
+        assign_uid_and_upsert(&store, &local_store, &inbox, "e3", &mut replayed).await;
+        assert_eq!(replayed.uid, 3);
+        assert_eq!(local_store.load_folder_metadata("inbox").unwrap()[0].uid, 3);
+
+        // A mail arriving from elsewhere still gets the next fresh UID.
+        let mut moved = stored(make_mail("L", "e9", "s", true), 0);
+        assign_uid_and_upsert(&store, &local_store, &inbox, "e9", &mut moved).await;
+        assert_eq!(moved.uid, 6);
+    }
+
+    #[tokio::test]
+    async fn leaving_a_folder_releases_the_uid_so_a_return_gets_a_higher_one() {
+        use crypto_primitives::aes::Aes256Key;
+        use crypto_primitives::key::GenericAesKey;
+        use crypto_primitives::randomizer_facade::RandomizerFacade;
+
+        let tmp = std::env::temp_dir().join(format!("tutabridge_test_{}", rand::random::<u64>()));
+        let key = GenericAesKey::Aes256(Aes256Key::generate(&RandomizerFacade::from_core(
+            rand_core::OsRng,
+        )));
+        let local_store = LocalStore::open(&tmp.join("s.db"), &tmp.join("mails"), key).unwrap();
+        let inbox = FolderInfo {
+            id: "inbox".to_string(),
+            list_id: "folders".to_string(),
+            entries_list_id: "inbox_entries".to_string(),
+            kind: tutasdk::folder_system::MailSetKind::Inbox,
+            imap_path: "INBOX".to_string(),
+            special_use: None,
+        };
+        let folder_by_entries: HashMap<&str, &FolderInfo> =
+            [("inbox_entries", &inbox)].into_iter().collect();
+        let mail_id = "KjlO6iI----0";
+        assert_eq!(
+            local_store.assign_folder_uids("inbox", &[mail_id]).unwrap()[mail_id],
+            1
+        );
+
+        let entry = mail_set_entry_id::construct(
+            tutasdk::date::DateTime::from_millis(1_700_000_000_000),
+            &tutasdk::GeneratedId(mail_id.to_string()),
+        );
+        // A move: the mail already sits in Archive, so its row and other
+        // placements stay; only the Inbox placement ends.
+        let store = MailStore::new();
+        let moved = crate::sync::tests::make_mail("L", mail_id, "s", true);
+        store
+            .set_folder("archive", vec![crate::sync::tests::stored(moved, 1)])
+            .await;
+        let delete = ev("tutanota", 0, "inbox_entries", &entry.0, Operation::Delete);
+        apply_mail_set_entry_delete(&store, &local_store, &folder_by_entries, &delete).await;
+
+        assert_eq!(
+            local_store.assign_folder_uids("inbox", &[mail_id]).unwrap()[mail_id],
+            2
+        );
+    }
 
     fn ev(app: &str, type_id: i64, list: &str, elem: &str, op: Operation) -> EntityUpdateEvent {
         EntityUpdateEvent {

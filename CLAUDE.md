@@ -97,6 +97,31 @@ rules:
   but letters that are not base + accent do not (`zazolc` misses
   "zażółć": `ł` is its own letter) — checked with SQLite 3.50.4's FTS5.
 
+### UIDs and UIDVALIDITY
+
+- **One source of truth:** `folder_uids(folder_id, element_id) → uid` in the
+  local store. `LocalStore::assign_folder_uids` is atomic and idempotent, so
+  the syncer and the event handler always get the same UID for a placement.
+  Never derive a UID from memory.
+- **Release on leave:** a MailSetEntry DELETE or a sync that no longer lists
+  a mail releases its UID in that folder. A return is a new arrival with a
+  higher UID (RFC 3501 §2.3.1.1).
+- **UIDVALIDITY is per folder** (`sync_state.uid_validity`), issued from a
+  store-wide counter that only grows (`store_meta.uid_validity`). Any
+  restart of a folder's counter — schema migration, reset, a recreated
+  folder id — yields a value no client has seen. UIDNEXT is the persisted
+  `next_uid` (or one past the highest UID in memory, if that is larger).
+- **Events wait for the bootstrap:** the event handler holds batches until
+  the syncer signals `BootstrapDone` (cache loaded + any full-metadata
+  sync). Earlier, a folder load or listing taken before an event overwrote
+  it. Held batches still advance the in-memory bus ids (reconnect resumes
+  after them); the wait gives up after 15 min or 10,000 batches.
+- **Failure is an error, not a guess:** a failed UID assignment leaves the
+  folder untouched; SELECT/STATUS answer `NO [UNAVAILABLE]`; multi-statement
+  writes to the mail rows, UID map and UID counters go through
+  `in_transaction` (rollback on error). `index_body` and the migration drop
+  run in autocommit.
+
 ### Labels ↔ IMAP keywords
 
 Tuta labels (`MailSet`s with `kind == Label`) are exposed as IMAP keywords
