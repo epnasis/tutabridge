@@ -134,12 +134,45 @@ impl MailStore {
         self.folder_list.read().await.clone()
     }
 
-    /// Look up a folder by its IMAP path (case-insensitive for INBOX).
+    /// The folder with exactly this name (INBOX in any case) — for "does
+    /// this name exist?", where a near-miss in another casing must not count.
+    pub async fn folder_by_exact_path(&self, path: &str) -> Option<FolderInfo> {
+        let path = match path.split_once('/') {
+            Some((first, rest)) if first.eq_ignore_ascii_case("INBOX") => format!("INBOX/{rest}"),
+            None if path.eq_ignore_ascii_case("INBOX") => "INBOX".to_owned(),
+            _ => path.to_owned(),
+        };
+        let list = self.folder_list.read().await;
+        list.iter().find(|f| f.imap_path == path).cloned()
+    }
+
+    /// Mailbox names are case-sensitive except `INBOX` (RFC 3501 §5.1).
+    /// Looked up in that order: the exact name (so a custom "Inbox/Child"
+    /// still opens), `INBOX` in any case, then a case-insensitive match only
+    /// when it is unique — a hand-typed `sent` still finds Sent, but `WORK`
+    /// never acts on `Work` while both exist.
     pub async fn folder_by_imap_path(&self, path: &str) -> Option<FolderInfo> {
         let list = self.folder_list.read().await;
-        list.iter()
-            .find(|f| f.imap_path == path || f.imap_path.eq_ignore_ascii_case(path))
-            .cloned()
+        if let Some(exact) = list.iter().find(|f| f.imap_path == path) {
+            return Some(exact.clone());
+        }
+        let inbox_folded = match path.split_once('/') {
+            Some((first, rest)) if first.eq_ignore_ascii_case("INBOX") => {
+                Some(format!("INBOX/{rest}"))
+            }
+            None if path.eq_ignore_ascii_case("INBOX") => Some("INBOX".to_owned()),
+            _ => None,
+        };
+        if let Some(found) = inbox_folded.and_then(|p| list.iter().find(|f| f.imap_path == p)) {
+            return Some(found.clone());
+        }
+        let mut loose = list
+            .iter()
+            .filter(|f| f.imap_path.eq_ignore_ascii_case(path));
+        match (loose.next(), loose.next()) {
+            (Some(only), None) => Some(only.clone()),
+            _ => None,
+        }
     }
 
     pub(crate) async fn set_folder_list(&self, folders: Vec<FolderInfo>) {
