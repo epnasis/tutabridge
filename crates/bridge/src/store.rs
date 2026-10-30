@@ -304,6 +304,43 @@ impl LocalStore {
         Ok(removed)
     }
 
+    /// Folders a client unsubscribed from (IMAP UNSUBSCRIBE). Kept as the
+    /// exceptions because every folder starts subscribed: a new Tuta folder
+    /// must show up in LSUB without a client having to subscribe to it.
+    pub fn unsubscribed_folders(&self) -> std::collections::HashSet<String> {
+        self.get_meta("unsubscribed_folders")
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default()
+    }
+
+    /// Read-modify-write under one lock and transaction: two sessions
+    /// changing subscriptions at once must not lose each other's change.
+    pub fn set_subscribed(&self, folder_id: &str, subscribed: bool) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        in_transaction(&conn, || {
+            let current: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM store_meta WHERE key = 'unsubscribed_folders'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let mut unsubscribed: std::collections::BTreeSet<String> = current
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default();
+            if subscribed {
+                unsubscribed.remove(folder_id);
+            } else {
+                unsubscribed.insert(folder_id.to_owned());
+            }
+            conn.execute(
+                "INSERT OR REPLACE INTO store_meta(key, value) VALUES ('unsubscribed_folders', ?1)",
+                [serde_json::to_string(&unsubscribed)?],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn verify_key(&self) -> bool {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
@@ -342,6 +379,14 @@ impl LocalStore {
         // the wipe and its rewrite could reissue a value a client has seen.
         in_transaction(&conn, || {
             let uid_validity = read_uid_validity(&conn)?;
+            // A client's subscriptions are its settings, not cached mail.
+            let unsubscribed: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM store_meta WHERE key = 'unsubscribed_folders'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
             conn.execute_batch(&format!(
                 "DELETE FROM mails;
                  DELETE FROM sync_state;
@@ -351,6 +396,12 @@ impl LocalStore {
                  INSERT INTO store_meta(key, value) VALUES ('schema_version', '{SCHEMA_VERSION}');
                  INSERT INTO store_meta(key, value) VALUES ('rendition_version', '{RENDITION_VERSION}');"
             ))?;
+            if let Some(unsubscribed) = unsubscribed {
+                conn.execute(
+                    "INSERT INTO store_meta(key, value) VALUES ('unsubscribed_folders', ?1)",
+                    [unsubscribed],
+                )?;
+            }
             write_uid_validity(&conn, next_uid_validity(uid_validity))
         })?;
         drop(conn);
@@ -1263,5 +1314,32 @@ mod tests {
         assert_eq!(store.drop_stale_renditions().unwrap(), 0);
         assert!(store.has_eml("old"));
         assert!(store.load_folder_metadata("inbox").unwrap()[0].has_details);
+    }
+
+    #[test]
+    fn concurrent_unsubscribes_are_all_kept() {
+        let store = std::sync::Arc::new(open_memory_store());
+        let threads: Vec<_> = (0..4)
+            .map(|t| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    for i in 0..50 {
+                        store.set_subscribed(&format!("f{t}_{i}"), false).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(store.unsubscribed_folders().len(), 200);
+    }
+
+    #[test]
+    fn a_reset_keeps_the_clients_subscriptions() {
+        let store = open_memory_store();
+        store.set_subscribed("work", false).unwrap();
+        store.reset().unwrap();
+        assert!(store.unsubscribed_folders().contains("work"));
     }
 }
