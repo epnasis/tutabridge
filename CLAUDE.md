@@ -269,6 +269,28 @@ onto a current `tutanota-release-*` tag, adapt the bridge to renamed APIs,
 redeploy. The log shows `ws connect failed: HTTP error: 474`, and
 `status.json` in the data dir carries the connection state for clients.
 
+### Deploying on this Mac
+
+The LaunchAgent `~/Library/LaunchAgents/com.tutabridge.plist` runs
+`~/.local/bin/tutabridge` (log: `~/Library/Logs/tutabridge.log`). Steps
+that worked on 2026-10-30:
+
+```bash
+cargo build --release
+/bin/cp -p ~/.local/bin/tutabridge ~/.local/bin/tutabridge.bak-<date>
+/bin/rm -f ~/.local/bin/tutabridge          # never overwrite in place
+/bin/cp target/release/tutabridge ~/.local/bin/tutabridge
+launchctl bootout gui/$(id -u)/com.tutabridge
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.tutabridge.plist
+```
+
+Observed, cause not established: copying over the existing file got the
+new process killed at launch (`load code signature error 2` in the system
+log). After a fresh copy, `launchctl kickstart -k` still got it killed
+(`OS_REASON_CODESIGNING`, "Launch Constraint Violation"), although
+`codesign --verify` passed and the binary ran from a shell. `bootout` +
+`bootstrap` started it. `cp` is aliased to `cp -i` in the login shell.
+
 ### Every rebuild re-asks the Keychain
 
 The binary is ad-hoc signed with a per-build identifier, so the saved-session
