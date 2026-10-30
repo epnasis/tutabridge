@@ -1033,21 +1033,41 @@ impl ImapSession {
                     let mail = self.mails[idx].mail.clone();
                     match self.backend.load_mail_details(&mail).await {
                         Ok(Some(details)) => {
-                            let (atts, attachments_complete) =
-                                match self.backend.load_attachments(&mail).await {
-                                    Ok(atts) => (atts, true),
-                                    Err(_) => (Vec::new(), false),
-                                };
+                            // As prefetch: a transient attachment failure keeps
+                            // the body in memory for the syncer's retry pass; a
+                            // permanent one ships and persists it body-only, or
+                            // it would never be saved or searchable.
+                            let (atts, attachments_pending) = match self
+                                .backend
+                                .load_attachments(&mail)
+                                .await
+                            {
+                                Ok(atts) => (atts, false),
+                                Err(e) if crate::sync::is_transient_attachment_error(&e) => {
+                                    (Vec::new(), true)
+                                }
+                                Err(e) => {
+                                    warn!(
+                                            "Attachments of uid={} failed for good, serving the body alone: {e}",
+                                            self.mails[idx].uid
+                                        );
+                                    (Vec::new(), false)
+                                }
+                            };
                             let refs: Vec<(&TutanotaFile, &[u8])> =
                                 atts.iter().map(|(f, d)| (f, d.as_slice())).collect();
                             let rfc = mail_to_rfc2822(&mail, Some(&details), &refs);
                             // Persist it like a prefetched body, so it survives a
-                            // restart and SEARCH BODY finds it. A rendition missing
-                            // its attachments stays memory-only: once on disk,
-                            // prefetch takes `has_eml` to mean done.
-                            if let (true, Some(eid), Some(ls)) =
-                                (attachments_complete, &elem_id, &self.local_store)
-                            {
+                            // restart and SEARCH BODY finds it. Still waiting for
+                            // attachments, it is persisted too, with the pending
+                            // flag the syncer's retry pass completes it from.
+                            if let (Some(eid), Some(ls)) = (&elem_id, &self.local_store) {
+                                // Set or cleared: a complete fetch ends a pending
+                                // state the database may still hold.
+                                if let Err(e) = ls.set_attachments_pending(eid, attachments_pending)
+                                {
+                                    warn!("Failed to record attachments pending {eid}: {e}");
+                                }
                                 if let Err(e) = ls.write_eml(eid, &rfc) {
                                     warn!("Failed to cache eml {eid}: {e}");
                                 } else if let Err(e) = ls.mark_has_details(eid) {
@@ -1072,7 +1092,11 @@ impl ImapSession {
                                         eid,
                                         details.clone(),
                                         rfc.clone(),
-                                        false,
+                                        // The syncer's attachment retry pass
+                                        // picks it up; without the flag the
+                                        // attachments stay missing until a
+                                        // restart.
+                                        attachments_pending,
                                     )
                                     .await;
                             }
@@ -2777,6 +2801,7 @@ mod tests {
         labels: Mutex<Vec<crate::labels::LabelInfo>>,
         fail_details: Mutex<bool>,
         fail_attachments: Mutex<bool>,
+        attachments_fail_for_good: Mutex<bool>,
         /// Server-side folder tree; folder operations edit it.
         folders: Mutex<Vec<FolderInfo>>,
         /// Ids of folders that hold mail (`folder_is_empty` answers false).
@@ -2799,6 +2824,7 @@ mod tests {
                 labels: Mutex::new(Vec::new()),
                 fail_details: Mutex::new(false),
                 fail_attachments: Mutex::new(false),
+                attachments_fail_for_good: Mutex::new(false),
                 folders: Mutex::new(vec![inbox_folder()]),
                 nonempty: Mutex::new(std::collections::HashSet::new()),
                 folder_ops: Mutex::new(Vec::new()),
@@ -3846,7 +3872,12 @@ mod tests {
     /// real `LocalStore`; returns the FETCH response, the backend and the store.
     async fn on_demand_fetch(
         fail_attachments: bool,
-    ) -> (Vec<String>, Arc<MockBackend>, Arc<LocalStore>) {
+    ) -> (
+        Vec<String>,
+        Arc<MockBackend>,
+        Arc<LocalStore>,
+        Arc<MailStore>,
+    ) {
         use crypto_primitives::aes::Aes256Key;
         use crypto_primitives::key::GenericAesKey;
         use crypto_primitives::randomizer_facade::RandomizerFacade;
@@ -3879,16 +3910,21 @@ mod tests {
                 }],
             )
             .await;
-        let mut session = ImapSession::new(store, backend.clone(), None, Some(local_store.clone()));
+        let mut session = ImapSession::new(
+            store.clone(),
+            backend.clone(),
+            None,
+            Some(local_store.clone()),
+        );
         session.handle_command("a LOGIN u p").await;
         session.handle_command("b SELECT INBOX").await;
         let resp = session.handle_command("c UID FETCH 1 (BODY.PEEK[])").await;
-        (resp, backend, local_store)
+        (resp, backend, local_store, store)
     }
 
     #[tokio::test]
     async fn on_demand_body_fetch_persists_and_indexes_the_rendition() {
-        let (resp, backend, local_store) = on_demand_fetch(false).await;
+        let (resp, backend, local_store, _) = on_demand_fetch(false).await;
         assert!(resp.last().unwrap().contains("OK"), "{resp:?}");
         assert!(
             resp[0].contains("BODY[] {") && resp[0].contains("\r\nX-Tutabridge-Authentication: "),
@@ -3907,13 +3943,431 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn on_demand_body_fetch_with_failed_attachments_is_not_persisted() {
-        let (resp, _, local_store) = on_demand_fetch(true).await;
+    async fn on_demand_body_fetch_with_failed_attachments_is_persisted_as_pending() {
+        let (resp, _, local_store, store) = on_demand_fetch(true).await;
         assert!(resp.last().unwrap().contains("OK"), "{resp:?}");
-        // Served from memory, but not written: on disk, prefetch would take
-        // it as done and the attachments would never be retried.
-        assert!(!local_store.has_eml("od"));
-        assert!(!local_store.load_folder_metadata("inbox").unwrap()[0].has_details);
+        // Saved and searchable now; flagged, in memory and on disk, for the
+        // syncer's attachment retry pass — a restart keeps the flag.
+        assert!(local_store.has_eml("od"));
+        assert!(local_store.load_folder_metadata("inbox").unwrap()[0].has_details);
+        assert!(store.get_folder("inbox").await[0].attachments_pending);
+        assert!(local_store
+            .attachments_pending_in("inbox")
+            .unwrap()
+            .contains("od"));
+    }
+
+    #[tokio::test]
+    async fn pending_attachments_are_retried_after_a_restart() {
+        let (_, backend, local_store, _) = on_demand_fetch(true).await;
+        *backend.fail_attachments.lock().unwrap() = false;
+        // A restarted bridge loads the cache: the rendition and the flag,
+        // but no details in memory.
+        let store = MailStore::new();
+        crate::sync::load_cached_folder(&store, &local_store, &inbox_folder())
+            .await
+            .unwrap();
+        let restored = store.get_folder("inbox").await;
+        assert!(
+            restored[0].attachments_pending,
+            "the flag survives the restart"
+        );
+        assert!(restored[0].details.is_none());
+        crate::sync::prefetch_details(
+            &store,
+            &local_store,
+            &*backend,
+            &inbox_folder(),
+            0,
+            &mut std::collections::HashMap::new(),
+        )
+        .await;
+        assert!(!store.get_folder("inbox").await[0].attachments_pending);
+        assert!(local_store
+            .attachments_pending_in("inbox")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pending_mail_without_its_body_is_rendered_not_emptied() {
+        let (_, backend, local_store, store) = on_demand_fetch(true).await;
+        // The cached rendition is gone (a rendition drop, say): memory has
+        // no body, the database still says pending.
+        local_store.delete_eml("od").unwrap();
+        let mut gone = store.get_folder("inbox").await[0].clone();
+        gone.rfc2822 = None;
+        gone.details = None;
+        store.set_folder("inbox", vec![gone]).await;
+        *backend.attachments_fail_for_good.lock().unwrap() = true;
+        crate::sync::prefetch_details(
+            &store,
+            &local_store,
+            &*backend,
+            &inbox_folder(),
+            0,
+            &mut std::collections::HashMap::new(),
+        )
+        .await;
+        let mail = &store.get_folder("inbox").await[0];
+        assert!(
+            mail.rfc2822
+                .as_deref()
+                .is_some_and(|r| r.contains("Subject")),
+            "the body must come back, not be emptied"
+        );
+        assert!(local_store.has_eml("od"));
+        // Re-rendered (body-only, attachments gone for good): no longer pending.
+        assert!(local_store
+            .attachments_pending_in("inbox")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_mail_pending_for_days_gives_up_despite_a_fresh_count() {
+        let (_, backend, local_store, store) = on_demand_fetch(true).await;
+        // Pending since the epoch: far past the age limit, though this
+        // process has not tried it yet.
+        local_store.exec_for_test("UPDATE mails SET attachments_pending = 2");
+        let _ = backend;
+        crate::sync::prefetch_details(
+            &store,
+            &local_store,
+            &*backend,
+            &inbox_folder(),
+            0,
+            &mut std::collections::HashMap::new(),
+        )
+        .await;
+        assert!(!store.get_folder("inbox").await[0].attachments_pending);
+        assert!(local_store
+            .attachments_pending_in("inbox")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_legacy_pending_flag_is_retried_not_given_up() {
+        let (_, backend, local_store, store) = on_demand_fetch(true).await;
+        // The column's earlier boolean form.
+        local_store.exec_for_test("UPDATE mails SET attachments_pending = 1");
+        crate::sync::prefetch_details(
+            &store,
+            &local_store,
+            &*backend,
+            &inbox_folder(),
+            0,
+            &mut std::collections::HashMap::new(),
+        )
+        .await;
+        // Still transient, attempt 1, age unknown: kept pending.
+        assert!(store.get_folder("inbox").await[0].attachments_pending);
+        // And the failed retry stamped a real time, so the age cap applies.
+        let since = local_store
+            .attachments_pending_since("od")
+            .unwrap()
+            .unwrap();
+        assert!(since > 1, "still legacy: {since}");
+        let _ = backend;
+    }
+
+    #[tokio::test]
+    async fn a_complete_on_demand_fetch_clears_the_flag() {
+        let (_, backend, local_store, store) = on_demand_fetch(true).await;
+        assert!(local_store
+            .attachments_pending_in("inbox")
+            .unwrap()
+            .contains("od"));
+        // Opened again in a new session, this time with every attachment.
+        *backend.fail_attachments.lock().unwrap() = false;
+        let mut cold = store.get_folder("inbox").await[0].clone();
+        cold.details = None;
+        cold.rfc2822 = None;
+        store.set_folder("inbox", vec![cold]).await;
+        let mut session = ImapSession::new(store.clone(), backend, None, Some(local_store.clone()));
+        session.handle_command("a LOGIN u p").await;
+        session.handle_command("b SELECT INBOX").await;
+        session.handle_command("c UID FETCH 1 (BODY.PEEK[])").await;
+        assert!(local_store
+            .attachments_pending_in("inbox")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn only_a_legacy_flag_is_stamped_by_a_retry() {
+        let local_store = temp_local_store();
+        local_store
+            .upsert_mail_metadata(&crate::sync::mail_to_metadata(
+                &make_mail("e1", "s", true),
+                "inbox",
+                1,
+            ))
+            .unwrap();
+        // Cleared (e.g. by an on-demand fetch): stays cleared.
+        local_store.stamp_legacy_attachments_pending("e1").unwrap();
+        assert_eq!(local_store.attachments_pending_since("e1").unwrap(), None);
+        local_store.exec_for_test("UPDATE mails SET attachments_pending = 1");
+        local_store.stamp_legacy_attachments_pending("e1").unwrap();
+        assert!(
+            local_store
+                .attachments_pending_since("e1")
+                .unwrap()
+                .unwrap()
+                > 1
+        );
+    }
+
+    #[test]
+    fn the_pending_since_time_keeps_the_earliest() {
+        let local_store = temp_local_store();
+        local_store
+            .upsert_mail_metadata(&crate::sync::mail_to_metadata(
+                &make_mail("e1", "s", true),
+                "inbox",
+                1,
+            ))
+            .unwrap();
+        local_store.set_attachments_pending("e1", true).unwrap();
+        let first = local_store
+            .attachments_pending_since("e1")
+            .unwrap()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        local_store.set_attachments_pending("e1", true).unwrap();
+        assert_eq!(
+            local_store.attachments_pending_since("e1").unwrap(),
+            Some(first)
+        );
+        local_store.set_attachments_pending("e1", false).unwrap();
+        assert_eq!(local_store.attachments_pending_since("e1").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_pending_mail_moved_in_by_a_sync_is_retried() {
+        let (_, backend, local_store, store) = on_demand_fetch(true).await;
+        // A sync finds it in the folder anew: memory had lost it.
+        store.set_folder("inbox", vec![]).await;
+        crate::sync::sync_folder(&store, &local_store, &*backend, &inbox_folder())
+            .await
+            .unwrap();
+        *backend.fail_attachments.lock().unwrap() = false;
+        crate::sync::prefetch_details(
+            &store,
+            &local_store,
+            &*backend,
+            &inbox_folder(),
+            0,
+            &mut std::collections::HashMap::new(),
+        )
+        .await;
+        assert!(local_store
+            .attachments_pending_in("inbox")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_retry_without_details_ends_the_pending_state() {
+        let (_, backend, local_store, store) = on_demand_fetch(true).await;
+        // After a restart: no details in memory, and the server has none.
+        let mut cold = store.get_folder("inbox").await[0].clone();
+        cold.details = None;
+        store.set_folder("inbox", vec![cold]).await;
+        backend.details.lock().unwrap().clear();
+        crate::sync::prefetch_details(
+            &store,
+            &local_store,
+            &*backend,
+            &inbox_folder(),
+            0,
+            &mut std::collections::HashMap::new(),
+        )
+        .await;
+        assert!(local_store
+            .attachments_pending_in("inbox")
+            .unwrap()
+            .is_empty());
+        assert!(!store.get_folder("inbox").await[0].attachments_pending);
+    }
+
+    #[tokio::test]
+    async fn a_transient_failure_gives_up_after_the_attempt_cap() {
+        let (_, backend, local_store, store) = on_demand_fetch(true).await;
+        let mut retries = crate::sync::AttachmentRetries::new();
+        retries.insert(
+            "od".to_string(),
+            crate::sync::AttachmentRetry::long_ago(crate::sync::ATTACHMENT_RETRY_MAX_ATTEMPTS - 1),
+        );
+        crate::sync::prefetch_details(
+            &store,
+            &local_store,
+            &*backend,
+            &inbox_folder(),
+            0,
+            &mut retries,
+        )
+        .await;
+        // Still failing on the last allowed attempt: kept body-only for good.
+        assert!(!store.get_folder("inbox").await[0].attachments_pending);
+        assert!(local_store
+            .attachments_pending_in("inbox")
+            .unwrap()
+            .is_empty());
+        assert!(local_store.has_eml("od"));
+    }
+
+    #[tokio::test]
+    async fn an_inline_create_keeps_its_body_flag() {
+        use crate::event_handler::{apply_mail_set_entry_create, PendingMail};
+        use tutasdk::event_bus::{EntityUpdateEvent, Operation};
+
+        let local_store = temp_local_store();
+        let mail_id = "KjlO6iI----0";
+        let mail = make_mail(mail_id, "s", true);
+        let backend = Arc::new(MockBackend::with_mails(vec![]));
+        let store = MailStore::new();
+        let inbox = inbox_folder();
+        let folder_by_entries: std::collections::HashMap<&str, &FolderInfo> =
+            [(inbox.entries_list_id.as_str(), &inbox)]
+                .into_iter()
+                .collect();
+        let mut pending = std::collections::HashMap::from([(
+            mail_id.to_string(),
+            PendingMail {
+                mail,
+                details: Some(make_details("<p>inline body</p>")),
+            },
+        )]);
+        let entry = tutasdk::mail_set_entry_id::construct(
+            tutasdk::date::DateTime::from_millis(1_700_000_000_000),
+            &GeneratedId(mail_id.to_string()),
+        );
+        let ev = EntityUpdateEvent {
+            application: "tutanota".to_string(),
+            type_id: 0,
+            instance_list_id: inbox.entries_list_id.clone(),
+            instance_id: entry.0,
+            operation: Operation::Create,
+            instance: None,
+            blob_instance: None,
+        };
+        apply_mail_set_entry_create(
+            &store,
+            &local_store,
+            &*backend,
+            &folder_by_entries,
+            &mut std::collections::HashSet::new(),
+            &mut pending,
+            &ev,
+        )
+        .await;
+
+        assert!(local_store.has_eml(mail_id));
+        // The flag must land on the row the upsert created, not before it.
+        assert!(local_store.load_folder_metadata("inbox").unwrap()[0].has_details);
+        // And the body is searchable: the one-time backfill will not do it.
+        assert_eq!(
+            local_store.search_body("inline").unwrap(),
+            vec![mail_id.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_permanent_attachment_failure_persists_the_body_alone() {
+        use crypto_primitives::aes::Aes256Key;
+        use crypto_primitives::key::GenericAesKey;
+        use crypto_primitives::randomizer_facade::RandomizerFacade;
+
+        let tmp = std::env::temp_dir().join(format!("tutabridge_test_{}", rand::random::<u64>()));
+        let key = GenericAesKey::Aes256(Aes256Key::generate(&RandomizerFacade::from_core(
+            rand_core::OsRng,
+        )));
+        let local_store =
+            Arc::new(LocalStore::open(&tmp.join("s.db"), &tmp.join("mails"), key).unwrap());
+        let mail = make_mail("od", "subj", true);
+        local_store
+            .upsert_mail_metadata(&crate::sync::mail_to_metadata(&mail, "inbox", 1))
+            .unwrap();
+        let backend = Arc::new(MockBackend::with_mails(vec![mail.clone()]));
+        backend.add_details("od", make_details("<p>wombat</p>"));
+        *backend.fail_attachments.lock().unwrap() = true;
+        *backend.attachments_fail_for_good.lock().unwrap() = true;
+        let store = MailStore::new();
+        populate_store(&store, &[mail]).await;
+        let mut session = ImapSession::new(store.clone(), backend, None, Some(local_store.clone()));
+        session.handle_command("a LOGIN u p").await;
+        session.handle_command("b SELECT INBOX").await;
+        let resp = session.handle_command("c UID FETCH 1 (BODY.PEEK[])").await;
+        assert!(resp.last().unwrap().contains("OK"), "{resp:?}");
+
+        assert!(local_store.has_eml("od"));
+        assert!(local_store.load_folder_metadata("inbox").unwrap()[0].has_details);
+        assert_eq!(
+            local_store.search_body("wombat").unwrap(),
+            vec!["od".to_string()]
+        );
+        assert!(!store.get_folder("inbox").await[0].attachments_pending);
+    }
+
+    #[test]
+    fn attachment_errors_that_may_pass_are_transient() {
+        use crate::sync::is_transient_attachment_error as transient;
+        // The SDK's own wording (ApiCallError / HttpError Display).
+        assert!(transient("ServerResponseError: Too Many Requests"));
+        assert!(transient("ServerResponseError: Service Unavailable"));
+        assert!(transient("Rest client error, source: connection reset"));
+        assert!(transient(
+            "InternalSdkError: Session key resolution failure: instance missing owner key/group data"
+        ));
+        assert!(transient("ServerResponseError: Invalid Software Version"));
+        assert!(!transient("ServerResponseError: Not Found"));
+    }
+
+    #[tokio::test]
+    async fn a_retry_that_fails_for_good_keeps_the_body() {
+        let (_, backend, local_store, store) = on_demand_fetch(true).await;
+        assert!(store.get_folder("inbox").await[0].attachments_pending);
+        *backend.attachments_fail_for_good.lock().unwrap() = true;
+        crate::sync::prefetch_details(
+            &store,
+            &local_store,
+            &*backend,
+            &inbox_folder(),
+            0,
+            &mut std::collections::HashMap::new(),
+        )
+        .await;
+        assert!(!store.get_folder("inbox").await[0].attachments_pending);
+        assert!(local_store.has_eml("od"));
+        assert!(local_store.load_folder_metadata("inbox").unwrap()[0].has_details);
+        assert_eq!(
+            local_store.search_body("quokka").unwrap(),
+            vec!["od".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_attachment_retry_completes_an_on_demand_fetch() {
+        let (_, backend, local_store, store) = on_demand_fetch(true).await;
+        *backend.fail_attachments.lock().unwrap() = false;
+        crate::sync::prefetch_details(
+            &store,
+            &local_store,
+            &*backend,
+            &inbox_folder(),
+            0,
+            &mut std::collections::HashMap::new(),
+        )
+        .await;
+        assert!(!store.get_folder("inbox").await[0].attachments_pending);
+        assert!(local_store.has_eml("od"));
+        assert!(local_store.load_folder_metadata("inbox").unwrap()[0].has_details);
+        assert_eq!(
+            local_store.search_body("quokka").unwrap(),
+            vec!["od".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -4567,7 +5021,13 @@ mod tests {
             String,
         > {
             if *self.fail_attachments.lock().unwrap() {
-                return Err("simulated attachment failure".to_string());
+                // Worded like the SDK's transient session-key failure unless
+                // a test asks for a permanent one.
+                return Err(if *self.attachments_fail_for_good.lock().unwrap() {
+                    "HTTP 404 (simulated)".to_string()
+                } else {
+                    "Session key resolution failure (simulated)".to_string()
+                });
             }
             // The mock has no attachment fixtures; the IMAP-session tests
             // only exercise body/header paths.

@@ -654,7 +654,7 @@ async fn prefetch_loop(
     // in the prefetch_loop's stack so it survives across store generations
     // but resets on bridge restart. The session-key-transient race typically
     // resolves within a couple of minutes, so a 60s minimum gap is plenty.
-    let mut attachment_retry_history: HashMap<String, std::time::Instant> = HashMap::new();
+    let mut attachment_retry_history: AttachmentRetries = HashMap::new();
     loop {
         if *shutdown.borrow() {
             return;
@@ -696,13 +696,55 @@ async fn prefetch_loop(
     }
 }
 
-/// Minimum interval between two attempts to reload a mail's attachments
-/// after a session-key-transient failure. Stops a tight retry loop while
-/// still recovering within ~1 minute once the server propagates the
-/// `_ownerEncSessionKey` / `_ownerGroup` fields.
+/// Interval before the first retry of a mail's attachments after a
+/// transient failure; it doubles with each further attempt, up to
+/// `ATTACHMENT_RETRY_MAX_DELAY`. Recovers within ~1 minute from the
+/// session-key race, without re-downloading a mail's attachments every
+/// minute forever when one keeps failing.
 const ATTACHMENT_RETRY_THROTTLE: Duration = Duration::from_secs(60);
+const ATTACHMENT_RETRY_MAX_DELAY: Duration = Duration::from_secs(6 * 60 * 60);
+/// After this many attempts a transient failure is treated as permanent:
+/// the body is kept without the attachments.
+pub(crate) const ATTACHMENT_RETRY_MAX_ATTEMPTS: u32 = 10;
+/// Pending longer than this, a transient failure is treated as permanent
+/// too: the attempt count is in memory, the age survives restarts.
+pub(crate) const ATTACHMENT_RETRY_MAX_AGE: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 
-async fn load_cached_folder(
+/// Per mail: when its attachments were last tried and how often.
+pub(crate) type AttachmentRetries = HashMap<String, AttachmentRetry>;
+
+#[derive(Clone, Copy)]
+pub(crate) struct AttachmentRetry {
+    last: std::time::Instant,
+    attempts: u32,
+}
+
+impl AttachmentRetry {
+    fn first(at: std::time::Instant) -> Self {
+        Self {
+            last: at,
+            attempts: 1,
+        }
+    }
+
+    /// A retry `attempts` deep whose backoff has long run out.
+    #[cfg(test)]
+    pub(crate) fn long_ago(attempts: u32) -> Self {
+        Self {
+            last: std::time::Instant::now() - ATTACHMENT_RETRY_MAX_DELAY,
+            attempts,
+        }
+    }
+
+    fn due(&self, now: std::time::Instant) -> bool {
+        let backoff = ATTACHMENT_RETRY_THROTTLE
+            .saturating_mul(1 << self.attempts.saturating_sub(1).min(16))
+            .min(ATTACHMENT_RETRY_MAX_DELAY);
+        now.duration_since(self.last) >= backoff
+    }
+}
+
+pub(crate) async fn load_cached_folder(
     store: &MailStore,
     local_store: &Arc<LocalStore>,
     folder: &FolderInfo,
@@ -722,6 +764,8 @@ async fn load_cached_folder(
             .load_folder_metadata(&folder_id)
             .map_err(|e| format!("{e}"))?;
 
+        // Restored, so the retry pass picks up where it was before a restart.
+        let pending = ls.attachments_pending_in(&folder_id).unwrap_or_default();
         let mut stored_mails = Vec::with_capacity(metas.len());
         for meta in &metas {
             let mail: Mail = serde_json::from_str(&meta.mail_json)
@@ -759,7 +803,7 @@ async fn load_cached_folder(
                 details: None,
                 rfc2822,
                 uid: meta.uid as u32,
-                attachments_pending: false,
+                attachments_pending: pending.contains(&meta.element_id),
             });
         }
         Ok(stored_mails)
@@ -833,12 +877,32 @@ pub(crate) async fn sync_folder(
         } else {
             // New mail, body not fetched yet — leave `rfc2822` empty so the
             // IMAP layer fetches it on demand (a placeholder would mask that).
+            // A mail new to this folder only (moved in) that still waits for
+            // attachments keeps the flag and its cached body: the retry pass
+            // only takes mails with a body.
+            let attachments_pending = elem_id.as_ref().is_some_and(|eid| {
+                local_store
+                    .attachments_pending_since(eid)
+                    .ok()
+                    .flatten()
+                    .is_some()
+            });
+            let rfc2822 = match (&elem_id, attachments_pending) {
+                (Some(eid), true) => match local_store.read_eml(eid) {
+                    Ok(eml) => eml,
+                    Err(e) => {
+                        warn!("Failed to read cached eml {}: {}", eid, e);
+                        None
+                    }
+                },
+                _ => None,
+            };
             updated.push(StoredMail {
                 mail: mail.clone(),
                 details: None,
-                rfc2822: None,
+                rfc2822,
                 uid,
-                attachments_pending: false,
+                attachments_pending,
             });
         }
 
@@ -882,13 +946,13 @@ pub(crate) async fn sync_folder(
     Ok(())
 }
 
-async fn prefetch_details(
+pub(crate) async fn prefetch_details(
     store: &MailStore,
     local_store: &LocalStore,
     backend: &dyn MailBackend,
     folder: &FolderInfo,
     body_prefetch_limit: usize,
-    attachment_retry_history: &mut HashMap<String, std::time::Instant>,
+    attachment_retry_history: &mut AttachmentRetries,
 ) {
     let mails = store.get_folder(&folder.id).await;
 
@@ -922,20 +986,23 @@ async fn prefetch_details(
     // their session-key metadata yet. Throttled per element id so we don't
     // hammer the server every store mutation.
     let now = std::time::Instant::now();
-    let attachment_retry_needed: Vec<(StoredMail, MailDetails)> = mails
+    // Only mails whose body is here: the retry adds attachments to it. One
+    // without (a dropped or unreadable rendition) gets its body from the
+    // first pass or an on-demand fetch first. Details may be missing — after
+    // a restart the cache holds only the rendition — and are loaded again.
+    let attachment_retry_needed: Vec<(StoredMail, Option<MailDetails>)> = mails
         .iter()
         .filter_map(|m| {
-            if !m.attachments_pending {
+            if !m.attachments_pending || m.rfc2822.is_none() {
                 return None;
             }
-            let details = m.details.clone()?;
             let eid = m.mail._id.as_ref()?.element_id.to_string();
-            if let Some(last) = attachment_retry_history.get(&eid) {
-                if now.duration_since(*last) < ATTACHMENT_RETRY_THROTTLE {
+            if let Some(retry) = attachment_retry_history.get(&eid) {
+                if !retry.due(now) {
                     return None;
                 }
             }
-            Some((m.clone(), details))
+            Some((m.clone(), m.details.clone()))
         })
         .collect();
 
@@ -1013,7 +1080,14 @@ async fn prefetch_details(
                         warn!("Failed to index body {}: {}", eid, e);
                     }
                     if attachments_pending {
-                        attachment_retry_history.insert(eid.clone(), now);
+                        attachment_retry_history.insert(eid.clone(), AttachmentRetry::first(now));
+                    } else {
+                        attachment_retry_history.remove(&eid);
+                    }
+                    // Set or cleared: a re-render with all attachments ends a
+                    // pending state the database may still hold.
+                    if let Err(e) = local_store.set_attachments_pending(&eid, attachments_pending) {
+                        warn!("Failed to record attachments pending {}: {}", eid, e);
                     }
 
                     store
@@ -1057,8 +1131,62 @@ async fn prefetch_details(
             Some(id) => id.element_id.to_string(),
             None => continue,
         };
-        attachment_retry_history.insert(eid.clone(), std::time::Instant::now());
+        let attempts = attachment_retry_history
+            .get(&eid)
+            .map_or(1, |retry| retry.attempts + 1);
+        attachment_retry_history.insert(
+            eid.clone(),
+            AttachmentRetry {
+                last: std::time::Instant::now(),
+                attempts,
+            },
+        );
+        let details = match details {
+            Some(details) => details.clone(),
+            None => match backend.load_mail_details(&stored.mail).await {
+                Ok(Some(details)) => details,
+                // No details to render with: nothing a retry can add.
+                Ok(None) => {
+                    if let Err(e) = local_store.set_attachments_pending(&eid, false) {
+                        warn!("Failed to clear attachments pending {}: {}", eid, e);
+                    }
+                    store
+                        .update_mail_rfc2822(
+                            &folder.id,
+                            &eid,
+                            stored.rfc2822.clone().unwrap_or_default(),
+                        )
+                        .await;
+                    attachment_retry_history.remove(&eid);
+                    continue;
+                }
+                Err(e) => {
+                    debug!("Attachment retry for {eid}: details not loaded: {e}");
+                    continue;
+                }
+            },
+        };
+        let details = &details;
 
+        // On the last allowed attempt, or once pending for longer than
+        // ATTACHMENT_RETRY_MAX_AGE (persisted, so restarts do not reset it),
+        // a transient failure counts as permanent.
+        let pending_for_ms = local_store
+            .attachments_pending_since(&eid)
+            .ok()
+            .flatten()
+            // A bare 1 is the column's earlier boolean form (unreleased
+            // 93fe631): pending, age unknown — not "since 1970".
+            .filter(|&since| since > 1)
+            .and_then(|since| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|now| now.as_millis() as i64 - since)
+            })
+            .unwrap_or(0);
+        let give_up = attempts >= ATTACHMENT_RETRY_MAX_ATTEMPTS
+            || pending_for_ms >= ATTACHMENT_RETRY_MAX_AGE.as_millis() as i64;
         match backend.load_attachments(&stored.mail).await {
             Ok(attachments) => {
                 let refs: Vec<(&TutanotaFile, &[u8])> =
@@ -1066,24 +1194,60 @@ async fn prefetch_details(
                 let rfc2822 = mail_to_rfc2822(&stored.mail, Some(details), &refs);
                 if let Err(e) = local_store.write_eml(&eid, &rfc2822) {
                     warn!("Failed to rewrite eml {}: {}", eid, e);
+                } else {
+                    // A mail first fetched on demand reaches this pass with
+                    // neither done: it was not persisted without attachments.
+                    if let Err(e) = local_store.mark_has_details(&eid) {
+                        warn!("Failed to mark has_details {}: {}", eid, e);
+                    }
+                    if let Err(e) = local_store.index_body(&eid, &strip_html(body_html(details))) {
+                        warn!("Failed to index body {}: {}", eid, e);
+                    }
                 }
                 store.update_mail_rfc2822(&folder.id, &eid, rfc2822).await;
+                if let Err(e) = local_store.set_attachments_pending(&eid, false) {
+                    warn!("Failed to clear attachments pending {}: {}", eid, e);
+                }
                 attachment_retry_history.remove(&eid);
                 debug!("Attachment retry succeeded for {}", eid);
             }
-            Err(e) if is_transient_attachment_error(&e) => {
-                debug!(
-                    "Attachment retry for {} still transient: {e} (next attempt in {:?})",
-                    eid, ATTACHMENT_RETRY_THROTTLE
-                );
+            Err(e) if is_transient_attachment_error(&e) && !give_up => {
+                debug!("Attachment retry {attempts} for {eid} still transient: {e}");
+                // Only a legacy flag gets a time: setting the flag here could
+                // undo an on-demand fetch that completed meanwhile.
+                if let Err(e) = local_store.stamp_legacy_attachments_pending(&eid) {
+                    warn!("Failed to stamp attachments pending {}: {}", eid, e);
+                }
             }
             Err(e) => {
                 warn!(
                     "Attachment retry for {} failed permanently: {e} — giving up",
                     eid
                 );
+                // A mail first fetched on demand has its body only in
+                // memory: keep it, body-only, as prefetch does on a
+                // permanent failure. (A prefetched one is already on disk.)
+                if !local_store.has_eml(&eid) {
+                    if let Some(rfc) = stored.rfc2822.as_deref() {
+                        if let Err(e) = local_store.write_eml(&eid, rfc) {
+                            warn!("Failed to cache eml {}: {}", eid, e);
+                        } else {
+                            if let Err(e) = local_store.mark_has_details(&eid) {
+                                warn!("Failed to mark has_details {}: {}", eid, e);
+                            }
+                            if let Err(e) =
+                                local_store.index_body(&eid, &strip_html(body_html(details)))
+                            {
+                                warn!("Failed to index body {}: {}", eid, e);
+                            }
+                        }
+                    }
+                }
                 // Clear the pending flag so we don't keep retrying a
                 // permanent failure (e.g. server returned 404).
+                if let Err(e) = local_store.set_attachments_pending(&eid, false) {
+                    warn!("Failed to clear attachments pending {}: {}", eid, e);
+                }
                 store
                     .update_mail_rfc2822(
                         &folder.id,
@@ -1097,15 +1261,32 @@ async fn prefetch_details(
     }
 }
 
-/// True when an attachment-load failure is the well-known
-/// "freshly-created File without propagated session-key" race that the
-/// `TutaSession::load_file_with_retry` helper logs as
-/// "still not decryptable after retries". Matching on the string keeps us
-/// decoupled from the SDK error variant tree.
-fn is_transient_attachment_error(err: &str) -> bool {
-    err.contains("missing owner key/group data")
-        || err.contains("Session key resolution failure")
-        || err.contains("still not decryptable")
+/// True when an attachment-load failure may succeed later, so the mail
+/// waits for the retry pass instead of shipping body-only for good (a
+/// body-only rendition on disk is never refetched). Matched on the SDK's
+/// error text (`ApiCallError` / `HttpError` Display), which keeps us
+/// decoupled from its variant tree:
+/// - the session-key race on a freshly created File;
+/// - throttling, server-side and network trouble (429, 503, 408, 502,
+///   500, 423, an expired session, a failed request).
+///
+/// Anything else (e.g. "Not Found") is taken as permanent.
+pub(crate) fn is_transient_attachment_error(err: &str) -> bool {
+    const TRANSIENT: [&str; 11] = [
+        "missing owner key/group data",
+        "Session key resolution failure",
+        "Too Many Requests",
+        "Service Unavailable",
+        "Request Timeout",
+        "Bad gateway",
+        "Internal Server",
+        "Locked",
+        "Session Expired",
+        "Rest client error",
+        // 474: Tuta retired this client version; a redeploy fixes it.
+        "Invalid Software Version",
+    ];
+    TRANSIENT.iter().any(|marker| err.contains(marker))
 }
 
 async fn retry<F, Fut, T>(mut f: F) -> Result<T, String>
@@ -1131,6 +1312,16 @@ where
         }
     }
     unreachable!()
+}
+
+/// A mail's HTML body as Tuta stores it (compressed or not).
+pub(crate) fn body_html(details: &MailDetails) -> &str {
+    details
+        .body
+        .compressedText
+        .as_deref()
+        .or(details.body.text.as_deref())
+        .unwrap_or("")
 }
 
 pub(crate) fn mail_to_metadata(mail: &Mail, folder_id: &str, uid: u32) -> MailMetadata {

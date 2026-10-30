@@ -219,7 +219,8 @@ impl LocalStore {
                 unread          INTEGER NOT NULL DEFAULT 1,
                 has_details     INTEGER NOT NULL DEFAULT 0,
                 uid             INTEGER NOT NULL DEFAULT 0,
-                mail_json       TEXT NOT NULL
+                mail_json       TEXT NOT NULL,
+                attachments_pending INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_mails_folder
                 ON mails(folder_id, received_date_ms DESC);
@@ -247,6 +248,17 @@ impl LocalStore {
             );
             INSERT OR REPLACE INTO store_meta(key, value) VALUES ('schema_version', '{SCHEMA_VERSION}');"
         ))?;
+
+        // Added after schema 5; a column, not a schema bump, so upgrading
+        // keeps the metadata (and the UIDVALIDITY clients hold).
+        let has_pending_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('mails') WHERE name = 'attachments_pending'")?
+            .exists([])?;
+        if !has_pending_column {
+            conn.execute_batch(
+                "ALTER TABLE mails ADD COLUMN attachments_pending INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
 
         debug!("LocalStore opened at {}", db_path.display());
 
@@ -455,7 +467,8 @@ impl LocalStore {
                 sender_address = excluded.sender_address,
                 received_date_ms = excluded.received_date_ms,
                 unread = excluded.unread,
-                has_details = excluded.has_details,
+                -- Never cleared here: the body may already be on disk.
+                has_details = CASE WHEN excluded.has_details = 1 THEN 1 ELSE mails.has_details END,
                 mail_json = excluded.mail_json",
             rusqlite::params![
                 meta.element_id,
@@ -622,6 +635,75 @@ impl LocalStore {
         }
 
         Ok(deleted)
+    }
+
+    /// Gives a bare 1 (the column's earlier boolean form) a real time, so
+    /// the age cap applies to it; leaves any other value alone.
+    pub fn stamp_legacy_attachments_pending(&self, element_id: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(1, |d| d.as_millis() as i64);
+        conn.execute(
+            "UPDATE mails SET attachments_pending = ?2
+             WHERE element_id = ?1 AND attachments_pending = 1",
+            rusqlite::params![element_id, now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Whether a mail's rendition on disk still lacks attachments the retry
+    /// pass should fetch. Persisted, so a restart does not finalize it
+    /// body-only.
+    pub fn set_attachments_pending(
+        &self,
+        element_id: &str,
+        pending: bool,
+    ) -> Result<(), StoreError> {
+        // The column holds when the mail first went pending (0 = not): the
+        // retry pass gives up by age, which a restart does not reset. A bare
+        // 1 (the earlier boolean form) is restamped, or it would never age.
+        let conn = self.conn.lock().unwrap();
+        let since_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(1, |d| d.as_millis() as i64);
+        conn.execute(
+            "UPDATE mails SET attachments_pending = CASE
+                 WHEN ?2 = 0 THEN 0
+                 WHEN attachments_pending IN (0, 1) THEN ?2
+                 ELSE attachments_pending END
+             WHERE element_id = ?1",
+            rusqlite::params![element_id, if pending { since_ms } else { 0 }],
+        )?;
+        Ok(())
+    }
+
+    /// When a mail's attachments first failed, in Unix ms; `None` when it is
+    /// not pending.
+    pub fn attachments_pending_since(&self, element_id: &str) -> Result<Option<i64>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let since: Option<i64> = conn
+            .query_row(
+                "SELECT attachments_pending FROM mails WHERE element_id = ?1",
+                [element_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(since.filter(|&ms| ms != 0))
+    }
+
+    pub fn attachments_pending_in(
+        &self,
+        folder_id: &str,
+    ) -> Result<std::collections::HashSet<String>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT element_id FROM mails WHERE folder_id = ?1 AND attachments_pending != 0",
+        )?;
+        let ids = stmt
+            .query_map([folder_id], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(ids)
     }
 
     pub fn mark_has_details(&self, element_id: &str) -> Result<(), StoreError> {
@@ -992,6 +1074,16 @@ mod tests {
         // Each folder has its own counter.
         assert_eq!(store.assign_folder_uids("custom", &["x"]).unwrap()["x"], 1);
         assert_eq!(store.folder_uid_state("inbox").unwrap().1, 5);
+    }
+
+    #[test]
+    fn an_upsert_never_clears_has_details() {
+        let store = open_memory_store();
+        store.upsert_mail_metadata(&meta("x", "inbox", 0)).unwrap();
+        store.mark_has_details("x").unwrap();
+        // A later metadata refresh says nothing about the body on disk.
+        store.upsert_mail_metadata(&meta("x", "inbox", 0)).unwrap();
+        assert!(store.load_folder_metadata("inbox").unwrap()[0].has_details);
     }
 
     #[test]
