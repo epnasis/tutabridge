@@ -134,7 +134,18 @@ impl MailStore {
         self.folder_list.read().await.clone()
     }
 
-    /// Look up a folder by its IMAP path (case-insensitive for INBOX).
+    /// The folder with exactly this name (INBOX in any case) — for "does
+    /// this name exist?", where a near-miss in another casing must not count.
+    pub async fn folder_by_exact_path(&self, path: &str) -> Option<FolderInfo> {
+        let path = match path.split_once('/') {
+            Some((first, rest)) if first.eq_ignore_ascii_case("INBOX") => format!("INBOX/{rest}"),
+            None if path.eq_ignore_ascii_case("INBOX") => "INBOX".to_owned(),
+            _ => path.to_owned(),
+        };
+        let list = self.folder_list.read().await;
+        list.iter().find(|f| f.imap_path == path).cloned()
+    }
+
     /// Mailbox names are case-sensitive except `INBOX` (RFC 3501 §5.1).
     /// Looked up in that order: the exact name (so a custom "Inbox/Child"
     /// still opens), `INBOX` in any case, then a case-insensitive match only
