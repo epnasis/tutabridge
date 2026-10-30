@@ -251,6 +251,11 @@ impl ImapSession {
             "STORE" => self.cmd_store(&tag, &args, false).await,
             "MOVE" => self.cmd_move(&tag, &args, false).await,
             "COPY" => self.cmd_copy(&tag),
+            "CREATE" | "DELETE" | "RENAME" => vec![format!(
+                "{} NO [CANNOT] {} is not supported: manage folders in Tuta; MOVE to existing folders (Trash, Archive, ...) works\r\n",
+                tag,
+                cmd.to_uppercase()
+            )],
             "IDLE" => {
                 self.idle_tag = Some(tag.clone());
                 vec!["+ idling\r\n".to_string()]
@@ -2473,6 +2478,69 @@ mod tests {
         assert!(resp.iter().any(|r| r.contains("[UIDNEXT 8]")), "{resp:?}");
         let resp = session.handle_command("e STATUS Nope (UIDNEXT)").await;
         assert!(resp[0].starts_with("e NO [NONEXISTENT]"), "{resp:?}");
+    }
+
+    #[tokio::test]
+    async fn move_to_trash_and_archive_by_their_served_names() {
+        use crate::tuta::{system_imap_name, system_special_use};
+        let system_folder = |id: &str, kind: MailSetKind| FolderInfo {
+            id: id.to_string(),
+            list_id: "folders".to_string(),
+            entries_list_id: format!("{id}_entries"),
+            kind,
+            imap_path: system_imap_name(kind).unwrap().to_string(),
+            special_use: system_special_use(kind).map(str::to_string),
+        };
+        let mails = vec![make_mail("e1", "one", false), make_mail("e2", "two", false)];
+        let backend = Arc::new(MockBackend::with_mails(mails.clone()));
+        let store = MailStore::new();
+        // Seeds INBOX only, so the folder list is set after it.
+        populate_store(&store, &mails).await;
+        store
+            .set_folder_list(vec![
+                inbox_folder(),
+                system_folder("trash", MailSetKind::Trash),
+                system_folder("archive", MailSetKind::Archive),
+            ])
+            .await;
+        let mut session = ImapSession::new(store, backend.clone(), None, None);
+        session.handle_command("a LOGIN u p").await;
+
+        // The folders a client must find to move into, with RFC 6154 roles.
+        let resp = session.handle_command("b LIST \"\" \"*\"").await;
+        assert!(
+            resp.iter()
+                .any(|r| r.contains("\\Trash") && r.contains("\"Trash\"")),
+            "{resp:?}"
+        );
+        assert!(
+            resp.iter()
+                .any(|r| r.contains("\\Archive") && r.contains("\"Archive\"")),
+            "{resp:?}"
+        );
+
+        session.handle_command("c SELECT INBOX").await;
+        let resp = session.handle_command("d UID MOVE 1 Trash").await;
+        assert!(resp.last().unwrap().contains("OK UID MOVE"), "{resp:?}");
+        let resp = session.handle_command("e UID MOVE 2 Archive").await;
+        assert!(resp.last().unwrap().contains("OK UID MOVE"), "{resp:?}");
+
+        let moved = backend.moved.lock().unwrap();
+        let targets: Vec<&str> = moved.iter().map(|(_, target)| target.as_str()).collect();
+        assert_eq!(targets, ["trash", "archive"]);
+    }
+
+    #[tokio::test]
+    async fn folder_management_answers_no_not_bad() {
+        let backend = Arc::new(MockBackend::with_mails(vec![]));
+        let (_, mut session) = make_session(backend).await;
+        session.handle_command("a LOGIN u p").await;
+        for cmd in ["CREATE Archive2", "DELETE Work", "RENAME Work Play"] {
+            let resp = session.handle_command(&format!("t {cmd}")).await;
+            assert!(resp[0].starts_with("t NO [CANNOT]"), "{cmd}: {resp:?}");
+        }
+        let resp = session.handle_command("t COPY 1 Trash").await;
+        assert!(resp[0].starts_with("t NO [CANNOT]"), "{resp:?}");
     }
 
     #[tokio::test]
