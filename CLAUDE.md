@@ -122,6 +122,24 @@ rules:
   `in_transaction` (rollback on error). `index_body` and the migration drop
   run in autocommit.
 
+### APPEND: Sent and Drafts
+
+- APPEND needs an authenticated session; the target folder is decided
+  once, before the literal is read. Refused literals (`{N+}`) are drained;
+  over the size cap → `NO [TOOBIG]`.
+- **Sent**: accepted and dropped (Tuta already filed the sent mail).
+- **Drafts**: parsed and saved through `DraftService` (`save_draft`, the
+  same draft creation `send_mail` uses), answered `OK [APPENDUID v uid]`
+  with the UID reserved in `folder_uids`. A client "replacing" a draft
+  appends the new one and expunges the old, which goes to Trash like any
+  IMAP delete — Tuta's own client updates in place. Lost on the way:
+  threading, Reply-To, From alias; plain-text bodies become `<pre>` HTML.
+- **Other folders**: `NO [CANNOT]` (Tuta cannot import mail).
+- `UID EXPUNGE` (UIDPLUS) expunges only `\Deleted` mail in the given set.
+- A sync must not undo a UID handed out while its listing ran:
+  `delete_mails_not_in` and `MailStore::replace_folder_keeping` keep
+  unlisted mail at or above the pre-listing `next_uid`.
+
 ### Labels ↔ IMAP keywords
 
 Tuta labels (`MailSet`s with `kind == Label`) are exposed as IMAP keywords

@@ -122,6 +122,12 @@ pub trait MailBackend: Send + Sync {
         target: &FolderInfo,
     ) -> Result<(), String>;
     async fn send_mail(&self, msg: &ParsedMessage) -> Result<(), String>;
+    /// Save a message as a Tuta draft (IMAP APPEND to Drafts); returns the
+    /// new Mail's id. The default refuses, so a backend without it answers
+    /// NO rather than pretending.
+    async fn save_draft(&self, _msg: &ParsedMessage) -> Result<IdTupleGenerated, String> {
+        Err("saving drafts is not supported by this backend".to_owned())
+    }
 
     // Folder management (IMAP CREATE / RENAME / DELETE). Defaults refuse, so
     // a backend without it answers NO rather than pretending.
@@ -664,6 +670,23 @@ impl TutaSession {
         }
 
         let randomizer = RandomizerFacade::from_core(rand_core::OsRng);
+        let draft = self.create_draft_impl(msg, &randomizer).await?;
+        let draft_id = draft.id;
+        let session_key = draft.session_key;
+        let attachment_keys = draft.attachment_keys;
+        self.send_draft(draft_id, session_key, attachment_keys, &randomizer)
+            .await
+    }
+
+    /// Create a Tuta draft from a parsed message: upload its attachments,
+    /// then `DraftService` POST. Shared by sending (SMTP) and saving
+    /// (IMAP APPEND to Drafts).
+    async fn create_draft_impl(
+        &self,
+        msg: &ParsedMessage,
+        randomizer: &RandomizerFacade,
+    ) -> Result<CreatedDraft, ApiCallError> {
+        let randomizer = randomizer.clone();
         let session_key: GenericAesKey = Aes256Key::generate(&randomizer).into();
 
         let mail_group_id = self
@@ -720,6 +743,22 @@ impl TutaSession {
             .await?;
 
         log::info!("Draft created: {:?}", draft_return.draft);
+        Ok(CreatedDraft {
+            id: draft_return.draft,
+            session_key,
+            attachment_keys,
+        })
+    }
+
+    async fn send_draft(
+        &self,
+        draft_id: IdTupleGenerated,
+        session_key: GenericAesKey,
+        attachment_keys: Vec<GenericAesKey>,
+        randomizer: &RandomizerFacade,
+    ) -> Result<(), ApiCallError> {
+        let randomizer = randomizer.clone();
+        let executor = self.logged_in.get_service_executor();
 
         // To populate `attachmentKeyData[]` we need each File entity's
         // IdTuple — the server allocated those when the draft was created.
@@ -729,7 +768,7 @@ impl TutaSession {
         let attachment_key_data = if attachment_keys.is_empty() {
             Vec::new()
         } else {
-            self.build_attachment_key_data(&draft_return.draft, &attachment_keys, &randomizer)
+            self.build_attachment_key_data(&draft_id, &attachment_keys, &randomizer)
                 .await?
         };
 
@@ -739,7 +778,7 @@ impl TutaSession {
         );
         let send_data = build_send_draft_data(
             session_key.as_bytes().to_vec(),
-            draft_return.draft,
+            draft_id,
             parameters_id,
             attachment_key_data,
         );
@@ -1250,6 +1289,21 @@ impl MailBackend for TutaSession {
     async fn send_mail(&self, msg: &ParsedMessage) -> Result<(), String> {
         self.send_mail_impl(msg).await.map_err(|e| format!("{e}"))
     }
+
+    async fn save_draft(&self, msg: &ParsedMessage) -> Result<IdTupleGenerated, String> {
+        let randomizer = RandomizerFacade::from_core(rand_core::OsRng);
+        self.create_draft_impl(msg, &randomizer)
+            .await
+            .map(|draft| draft.id)
+            .map_err(|e| format!("{e}"))
+    }
+}
+
+/// A draft `DraftService` just created, with what sending it needs.
+struct CreatedDraft {
+    id: IdTupleGenerated,
+    session_key: GenericAesKey,
+    attachment_keys: Vec<GenericAesKey>,
 }
 
 struct DiskFileClient {

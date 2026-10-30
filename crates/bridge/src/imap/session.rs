@@ -77,6 +77,10 @@ impl ImapSession {
         self.idle_tag.is_some()
     }
 
+    pub fn is_authenticated(&self) -> bool {
+        matches!(self.state, State::Authenticated | State::Selected)
+    }
+
     pub fn is_awaiting_auth(&self) -> bool {
         self.auth_tag.is_some()
     }
@@ -274,12 +278,50 @@ impl ImapSession {
     /// connection loop), which is what lets a client's "save to Sent" succeed
     /// without creating a duplicate.
     pub(crate) async fn append_targets_sent(&self, mailbox: &str) -> bool {
+        matches!(self.append_target(mailbox).await, AppendTarget::Sent)
+    }
+
+    pub(crate) async fn append_target(&self, mailbox: &str) -> AppendTarget {
         let name = super::utf7::decode(mailbox).unwrap_or_else(|| mailbox.to_string());
-        self.store
-            .folder_by_imap_path(&name)
-            .await
-            .map(|f| f.special_use.as_deref() == Some("\\Sent"))
-            .unwrap_or(false)
+        match self.store.folder_by_imap_path(&name).await {
+            Some(f) if f.kind == MailSetKind::Sent => AppendTarget::Sent,
+            Some(f) if f.kind == MailSetKind::Draft => AppendTarget::Drafts(f),
+            _ => AppendTarget::Other,
+        }
+    }
+
+    /// APPEND to Drafts: the message becomes a Tuta draft. Its UID is assigned
+    /// now, from the same persisted map the event handler uses when the draft
+    /// shows up in Drafts, so `APPENDUID` (RFC 4315, UIDPLUS is advertised)
+    /// names the UID the client will see. Returns the tagged response line.
+    pub(crate) async fn append_draft(&self, tag: &str, drafts: &FolderInfo, raw: &[u8]) -> String {
+        let parsed = crate::mail::parser::parse_rfc2822(&String::from_utf8_lossy(raw));
+        let mail_id = match self.backend.save_draft(&parsed).await {
+            Ok(id) => id,
+            Err(e) => {
+                warn!("APPEND to Drafts failed: {e}");
+                return format!(
+                    "{tag} NO APPEND failed: the draft was not saved (see the bridge log)\r\n"
+                );
+            }
+        };
+        let Some(local_store) = &self.local_store else {
+            return format!("{tag} OK APPEND completed\r\n");
+        };
+        let element_id = mail_id.element_id.to_string();
+        let assigned = local_store
+            .folder_uid_state(&drafts.id)
+            .and_then(|(validity, _)| {
+                let uids = local_store.assign_folder_uids(&drafts.id, &[element_id.as_str()])?;
+                Ok((validity, uids.get(&element_id).copied()))
+            });
+        match assigned {
+            Ok((validity, Some(uid))) => {
+                format!("{tag} OK [APPENDUID {validity} {uid}] APPEND completed\r\n")
+            }
+            // Saved; only the UID is unknown, which RFC 4315 permits.
+            _ => format!("{tag} OK APPEND completed\r\n"),
+        }
     }
 
     fn cmd_capability(&self, tag: &str) -> Vec<String> {
@@ -1531,6 +1573,7 @@ impl ImapSession {
             "FETCH" => self.cmd_fetch(tag, subargs, true).await,
             "SEARCH" => self.cmd_search(tag, subargs, true).await,
             "STORE" => self.cmd_store(tag, subargs, true).await,
+            "EXPUNGE" => self.cmd_uid_expunge(tag, subargs).await,
             "MOVE" => self.cmd_move(tag, subargs, true).await,
             "COPY" => self.cmd_copy(tag),
             _ => vec![format!("{} BAD Unknown UID subcommand\r\n", tag)],
@@ -1545,14 +1588,42 @@ impl ImapSession {
     }
 
     async fn cmd_expunge(&mut self, tag: &str) -> Vec<String> {
+        self.expunge(tag, "EXPUNGE", None).await
+    }
+
+    /// UID EXPUNGE (RFC 4315, required by the advertised UIDPLUS): only the
+    /// `\Deleted` messages in the set, so a client replacing one draft does
+    /// not expunge another session's deletions.
+    async fn cmd_uid_expunge(&mut self, tag: &str, args: &str) -> Vec<String> {
         if self.state != State::Selected {
             return vec![format!("{} NO No mailbox selected\r\n", tag)];
         }
+        let Some(indices) = self.resolve_sequence_set(args.trim(), true) else {
+            return vec![format!("{tag} BAD UID EXPUNGE needs a UID set\r\n")];
+        };
+        let in_set: std::collections::HashSet<u32> = indices
+            .iter()
+            .filter_map(|&i| self.mails.get(i))
+            .map(|m| m.uid)
+            .collect();
+        self.expunge(tag, "UID EXPUNGE", Some(&in_set)).await
+    }
+
+    async fn expunge(
+        &mut self,
+        tag: &str,
+        cmd: &str,
+        only: Option<&std::collections::HashSet<u32>>,
+    ) -> Vec<String> {
+        if self.state != State::Selected {
+            return vec![format!("{} NO No mailbox selected\r\n", tag)];
+        }
+        let chosen = |m: &CachedMail| m.deleted && only.map_or(true, |set| set.contains(&m.uid));
 
         let deleted_ids: Vec<_> = self
             .mails
             .iter()
-            .filter(|m| m.deleted)
+            .filter(|m| chosen(m))
             .filter_map(|m| m.mail._id.clone())
             .collect();
 
@@ -1566,7 +1637,7 @@ impl ImapSession {
         let mut seq = 1u32;
         let mut i = 0;
         while i < self.mails.len() {
-            if self.mails[i].deleted {
+            if chosen(&self.mails[i]) {
                 responses.push(format!("* {} EXPUNGE\r\n", seq));
                 self.mails.remove(i);
             } else {
@@ -1575,7 +1646,7 @@ impl ImapSession {
             }
         }
 
-        responses.push(format!("{} OK EXPUNGE completed\r\n", tag));
+        responses.push(format!("{tag} OK {cmd} completed\r\n"));
         responses
     }
 
@@ -2188,6 +2259,19 @@ pub(crate) struct AppendRequest {
     pub tag: String,
     pub mailbox: String,
     pub literal_size: usize,
+    /// `{N+}`: the client sends the bytes without waiting for `+`, so they
+    /// must be read even when the APPEND is refused.
+    pub non_sync: bool,
+}
+
+/// Where an APPEND lands.
+pub(crate) enum AppendTarget {
+    /// Tuta keeps sent mail itself: accepted as a no-op.
+    Sent,
+    /// Saved as a Tuta draft.
+    Drafts(FolderInfo),
+    /// Not supported.
+    Other,
 }
 
 /// Parse an `APPEND` command line. Returns `None` if it is not a well-formed
@@ -2198,25 +2282,18 @@ pub(crate) fn parse_append(line: &str) -> Option<AppendRequest> {
     if !cmd.eq_ignore_ascii_case("APPEND") {
         return None;
     }
-    let mailbox = append_first_token(&args)?;
+    let (mailbox, _) = parse_imap_token(args.trim_start());
+    if mailbox.is_empty() {
+        return None;
+    }
     let literal_size = append_literal_size(&args)?;
+    let non_sync = args.trim_end().ends_with("+}");
     Some(AppendRequest {
         tag,
         mailbox,
         literal_size,
+        non_sync,
     })
-}
-
-/// The first argument token of an APPEND (the mailbox), honoring quoting.
-fn append_first_token(args: &str) -> Option<String> {
-    let s = args.trim_start();
-    if let Some(rest) = s.strip_prefix('"') {
-        let end = rest.find('"')?;
-        Some(rest[..end].to_string())
-    } else {
-        let end = s.find(char::is_whitespace).unwrap_or(s.len());
-        (end > 0).then(|| s[..end].to_string())
-    }
 }
 
 /// The size declared by the trailing `{N}` (or non-sync `{N+}`) literal.
@@ -2801,6 +2878,10 @@ mod tests {
         labels: Mutex<Vec<crate::labels::LabelInfo>>,
         fail_details: Mutex<bool>,
         fail_attachments: Mutex<bool>,
+        /// Run once mid-listing, as the event handler would: the mail gets
+        /// a UID and enters memory, but the listing does not show it.
+        #[allow(clippy::type_complexity)]
+        during_listing: Mutex<Option<(Arc<MailStore>, Arc<LocalStore>, Mail)>>,
         attachments_fail_for_good: Mutex<bool>,
         /// Server-side folder tree; folder operations edit it.
         folders: Mutex<Vec<FolderInfo>>,
@@ -2824,6 +2905,7 @@ mod tests {
                 labels: Mutex::new(Vec::new()),
                 fail_details: Mutex::new(false),
                 fail_attachments: Mutex::new(false),
+                during_listing: Mutex::new(None),
                 attachments_fail_for_good: Mutex::new(false),
                 folders: Mutex::new(vec![inbox_folder()]),
                 nonempty: Mutex::new(std::collections::HashSet::new()),
@@ -2922,6 +3004,49 @@ mod tests {
             rand_core::OsRng,
         )));
         Arc::new(LocalStore::open(&tmp.join("s.db"), &tmp.join("mails"), key).unwrap())
+    }
+
+    #[tokio::test]
+    async fn mail_given_a_uid_during_the_listing_stays_in_memory() {
+        let local_store = temp_local_store();
+        let backend = Arc::new(MockBackend::with_mails(vec![make_mail("e1", "s", true)]));
+        let store = MailStore::new();
+        crate::sync::sync_folder(&store, &local_store, &*backend, &inbox_folder())
+            .await
+            .unwrap();
+        *backend.during_listing.lock().unwrap() = Some((
+            store.clone(),
+            local_store.clone(),
+            make_mail("e2", "new", true),
+        ));
+        crate::sync::sync_folder(&store, &local_store, &*backend, &inbox_folder())
+            .await
+            .unwrap();
+        let mut uids: Vec<u32> = store
+            .get_folder("inbox")
+            .await
+            .iter()
+            .map(|m| m.uid)
+            .collect();
+        uids.sort();
+        // Dropping UID 2 would EXPUNGE it now and reissue it next sync.
+        assert_eq!(uids, [1, 2]);
+        // e1 deleted, e2 now listed, and e3 arrives mid-listing AND is
+        // listed: e1 goes, nothing appears twice.
+        let e3 = make_mail("e3", "newer", true);
+        *backend.mails.lock().unwrap() = vec![make_mail("e2", "new", true), e3.clone()];
+        *backend.during_listing.lock().unwrap() = Some((store.clone(), local_store.clone(), e3));
+        crate::sync::sync_folder(&store, &local_store, &*backend, &inbox_folder())
+            .await
+            .unwrap();
+        let mut uids: Vec<u32> = store
+            .get_folder("inbox")
+            .await
+            .iter()
+            .map(|m| m.uid)
+            .collect();
+        uids.sort();
+        assert_eq!(uids, [2, 3]);
     }
 
     #[tokio::test]
@@ -3813,6 +3938,25 @@ mod tests {
 
         let resp = later.handle_command("e SUBSCRIBE Nope").await;
         assert!(resp[0].starts_with("e NO [NONEXISTENT]"), "{resp:?}");
+    }
+
+    #[tokio::test]
+    async fn uid_expunge_removes_only_the_named_deleted_messages() {
+        let mails = vec![make_mail("e1", "a", false), make_mail("e2", "b", false)];
+        let backend = Arc::new(MockBackend::with_mails(mails));
+        let (_, mut session) = make_session(backend.clone()).await;
+        session.handle_command("a LOGIN u p").await;
+        session.handle_command("b SELECT INBOX").await;
+        session
+            .handle_command("c STORE 1:2 +FLAGS (\\Deleted)")
+            .await;
+        let resp = session.handle_command("d UID EXPUNGE 2").await;
+        assert_eq!(resp, ["* 2 EXPUNGE\r\n", "d OK UID EXPUNGE completed\r\n"]);
+        let trashed = backend.trashed.lock().unwrap().clone();
+        assert_eq!(trashed.len(), 1);
+        assert_eq!(trashed[0].element_id.to_string(), "e2");
+        let resp = session.handle_command("e UID EXPUNGE x").await;
+        assert!(resp[0].starts_with("e BAD"), "{resp:?}");
     }
 
     #[tokio::test]
@@ -4958,10 +5102,25 @@ mod tests {
     impl MailBackend for MockBackend {
         async fn load_mail_ids_for_folder(
             &self,
-            _folder: &FolderInfo,
+            folder: &FolderInfo,
             _limit: usize,
         ) -> Result<Vec<Mail>, String> {
-            Ok(self.mails.lock().unwrap().clone())
+            let listing = self.mails.lock().unwrap().clone();
+            let hook = self.during_listing.lock().unwrap().take();
+            if let Some((store, local_store, mail)) = hook {
+                let eid = mail._id.as_ref().unwrap().element_id.to_string();
+                let uids = local_store.assign_folder_uids(&folder.id, &[&eid]).unwrap();
+                let mut held = store.get_folder(&folder.id).await;
+                held.push(StoredMail {
+                    mail,
+                    details: None,
+                    rfc2822: None,
+                    uid: uids[&eid],
+                    attachments_pending: false,
+                });
+                store.set_folder(&folder.id, held).await;
+            }
+            Ok(listing)
         }
         async fn load_mail(
             &self,

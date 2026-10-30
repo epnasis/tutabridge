@@ -325,6 +325,11 @@ pub fn mail_to_rfc2822(
         if !details.recipients.ccRecipients.is_empty() {
             msg.push_str(&address_field("Cc", &details.recipients.ccRecipients));
         }
+        // Only the sender's own copies (drafts, sent mail) carry Bcc; a draft
+        // reopened without it would be sent without those recipients.
+        if !details.recipients.bccRecipients.is_empty() {
+            msg.push_str(&address_field("Bcc", &details.recipients.bccRecipients));
+        }
     } else if let Some(ref first) = mail.firstRecipient {
         msg.push_str(&address_field("To", [first]));
     }
@@ -1396,6 +1401,20 @@ mod tests {
         ])
         .filter(|line| line.trim_start().to_uppercase().starts_with(&ours))
         .collect()
+    }
+
+    #[test]
+    fn a_drafts_bcc_survives_the_rendition() {
+        let mut details = auth_details(0, "");
+        details.recipients.bccRecipients = vec![MailAddress {
+            _id: None,
+            name: String::new(),
+            address: "hidden@x.test".to_string(),
+            contact: None,
+            _errors: Default::default(),
+        }];
+        let rfc = mail_to_rfc2822(&auth_mail("me@x.test"), Some(&details), &[]);
+        assert!(rfc.contains("\r\nBcc: hidden@x.test\r\n"), "{rfc:?}");
     }
 
     #[test]

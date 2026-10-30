@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -410,6 +410,24 @@ impl MailStore {
                 m.attachments_pending = false;
             }
         }
+        drop(folders);
+        self.bump_generation();
+    }
+
+    /// Replace a folder's mails, keeping those of the CURRENT ones that
+    /// `keep` selects — decided under the write lock, so an event landing
+    /// meanwhile is neither undone nor overwritten.
+    pub(crate) async fn replace_folder_keeping(
+        &self,
+        folder_id: &str,
+        mut mails: Vec<StoredMail>,
+        keep: impl Fn(&StoredMail) -> bool,
+    ) {
+        let mut folders = self.folders.write().await;
+        if let Some(current) = folders.remove(folder_id) {
+            mails.extend(current.into_iter().filter(|m| keep(m)));
+        }
+        folders.insert(folder_id.to_string(), mails);
         drop(folders);
         self.bump_generation();
     }
@@ -826,6 +844,11 @@ pub(crate) async fn sync_folder(
     backend: &dyn MailBackend,
     folder: &FolderInfo,
 ) -> Result<(), String> {
+    // Before the listing: UIDs handed out from here on belong to mail the
+    // listing may not show yet, which the cleanup below must keep.
+    let (_, listed_below_uid) = local_store
+        .folder_uid_state(&folder.id)
+        .map_err(|e| format!("UID state of {}: {e}", folder.imap_path))?;
     // `0` = load every entry (the SDK paginates). Metadata is cheap relative
     // to bodies (no blob fetch), so we never truncate the list.
     let new_mails = retry(|| backend.load_mail_ids_for_folder(folder, 0)).await?;
@@ -917,7 +940,7 @@ pub(crate) async fn sync_folder(
         .iter()
         .filter_map(|m| m._id.as_ref().map(|id| id.element_id.as_str()))
         .collect();
-    match local_store.delete_mails_not_in(&folder.id, &current_ids) {
+    match local_store.delete_mails_not_in(&folder.id, &current_ids, listed_below_uid) {
         Ok(deleted) => {
             for eid in &deleted {
                 if let Err(e) = local_store.delete_eml(eid) {
@@ -941,7 +964,20 @@ pub(crate) async fn sync_folder(
         ),
     }
 
-    store.set_folder(&folder.id, updated).await;
+    // Mail the event handler added while the listing ran may be missing from
+    // it; dropping it would EXPUNGE it from clients and bring it back under
+    // the same UID at the next sync. Kept as the DB cleanup above keeps it.
+    let listed: HashSet<&str> = current_ids.iter().copied().collect();
+    store
+        .replace_folder_keeping(&folder.id, updated, |mail| {
+            mail.uid >= listed_below_uid
+                && mail
+                    .mail
+                    ._id
+                    .as_ref()
+                    .is_some_and(|id| !listed.contains(id.element_id.as_str()))
+        })
+        .await;
 
     Ok(())
 }
@@ -1441,6 +1477,28 @@ pub(crate) mod tests {
             Instant::now() - Duration::from_secs(1),
         );
         assert!(!store.body_fetch_on_cooldown("mail-a"));
+    }
+
+    #[tokio::test]
+    async fn replace_folder_keeping_judges_the_folder_as_it_is_now() {
+        let store = MailStore::new();
+        let listed = stored(make_mail("L1", "M1", "listed", false), 1);
+        let late = stored(make_mail("L1", "M2", "late", false), 5);
+        // An event added `late` after the sync took its snapshot: kept.
+        store.set_folder("f", vec![late.clone()]).await;
+        store
+            .replace_folder_keeping("f", vec![listed.clone()], |m| m.uid >= 3)
+            .await;
+        let mut uids: Vec<u32> = store.get_folder("f").await.iter().map(|m| m.uid).collect();
+        uids.sort();
+        assert_eq!(uids, [1, 5]);
+        // An event deleted it before the write: not brought back.
+        store.set_folder("f", vec![]).await;
+        store
+            .replace_folder_keeping("f", vec![listed], |m| m.uid >= 3)
+            .await;
+        let uids: Vec<u32> = store.get_folder("f").await.iter().map(|m| m.uid).collect();
+        assert_eq!(uids, [1]);
     }
 
     #[tokio::test]
